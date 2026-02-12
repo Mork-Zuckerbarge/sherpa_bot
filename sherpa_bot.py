@@ -1,42 +1,256 @@
+import os
+import json
+import time
+import re
+import random
+import threading
+import queue
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 import gradio as gr
 from openai import OpenAI
 import tweepy
 import feedparser
 import schedule
-import time
-import json
-import threading
-import queue
-import os
-from datetime import datetime, timedelta, timezone
-from cryptography.fernet import Fernet
-from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 import html2text
 import httpx
-import re
-import random
-from collections import defaultdict
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from pathlib import Path
 
-# ------- Add these near your imports -------
-import os, json, time, random
-from datetime import datetime, timezone, timedelta
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+load_dotenv()
 
 REPLY_STATE_FILE = "reply_state.json"
-MAX_DAILY_REPLIES = 2
+MAX_DAILY_REPLIES = 3
 MAX_FETCH = 50
 MAX_AGE_HOURS = 23
 MAX_BACKLOG = 20   # store at most this many tweet IDs for tomorrow
 
+MORK_CORE_URL = os.getenv("MORK_CORE_URL", "http://localhost:8787").rstrip("/")
+USE_OPENAI = False
+def _get_core_url():
+    u = (os.getenv("MORK_CORE_URL") or "").strip().rstrip("/")
+    if not u:
+        return "http://localhost:8787"
+    if "<" in u or "IP-OF" in u.upper():
+        print(f"⚠ MORK_CORE_URL is a placeholder: '{u}'. Please set a real URL.")
+        return "http://localhost:8787"
+    return u
+
+MORK_CORE_URL = _get_core_url()
+
+def _core_base_url() -> str:
+    """
+    Returns a safe/usable base URL for Mork Core.
+    Fixes common mistakes like literally having '<ip-of-mork-core>' in the env var,
+    and strips trailing slashes.
+    """
+    raw = (MORK_CORE_URL or "").strip().strip('"').strip("'")
+    raw = raw.rstrip("/")
+
+    # Common placeholder mistake: "http://<ip-of-mork-core>:8787"
+    if "<" in raw or ">" in raw:
+        print(f"⚠ MORK_CORE_URL looks like a placeholder: {raw!r}. Falling back to http://localhost:8787")
+        return "http://localhost:8787"
+
+    # If user accidentally pasted a URL-encoded placeholder (%3c ... %3e)
+    if "%3c" in raw.lower() or "%3e" in raw.lower():
+        print(f"⚠ MORK_CORE_URL looks URL-encoded/invalid: {raw!r}. Falling back to http://localhost:8787")
+        return "http://localhost:8787"
+
+    if not re.match(r"^https?://", raw):
+        print(f"⚠ MORK_CORE_URL missing scheme: {raw!r}. Prepending http://")
+        raw = "http://" + raw
+
+    return raw
+
+def core_reflect(timeout=20) -> bool:
+    try:
+        r = requests.post(f"{MORK_CORE_URL}/brain/reflect", json={}, timeout=timeout)
+        if r.ok:
+            return True
+        print(f"⚠ core_reflect bad status {r.status_code}: {r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"⚠ core_reflect failed: {e}")
+        return False
+
+def core_compose_payload(payload: dict, timeout=10) -> str:
+    """
+    Compose a tweet via Mork Core.
+
+    Supports BOTH styles:
+      - NEW: POST /x/compose with JSON payload (recommended)
+      - OLD: GET /x/compose?mode=observation|edge|reflection (fallback)
+
+    payload examples:
+      {"kind":"feed","title":...,"text":...,"url":...,"maxChars":260}
+      {"kind":"meme","memeName":"when-i-see-slippage.png","maxChars":260}
+      {"kind":"arb","maxChars":260}
+      {"kind":"observation","maxChars":260}
+      {"kind":"reflection","maxChars":260}
+    """
+    base = _core_base_url()
+    payload = payload or {}
+    payload.setdefault("maxChars", 260)
+
+    # 1) Try POST (new style)
+    try:
+        r = requests.post(f"{base}/x/compose", json=payload, timeout=timeout)
+        if r.ok:
+            j = r.json() if "application/json" in (r.headers.get("content-type") or "") else {}
+            out = (j.get("tweet") or "").strip()
+            return out
+        print(f"⚠ core_compose bad status {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠ core_compose POST failed: {e}")
+
+    # 2) Fallback to GET (old style)
+    try:
+        mode = (payload.get("mode") or payload.get("kind") or "observation")
+        r = requests.get(f"{base}/x/compose", params={"mode": mode}, timeout=min(5, timeout))
+        if not r.ok:
+            print(f"⚠ core_compose GET bad status {r.status_code}: {r.text[:200]}")
+            return ""
+        j = r.json() if "application/json" in (r.headers.get("content-type") or "") else {}
+        return (j.get("tweet") or "").strip()
+    except Exception as e:
+        print(f"⚠ core_compose GET failed: {e}")
+        return ""
+def _wrap_280(s: str, max_len: int = 260) -> str:
+    # Preserve newlines for tweet formatting, but collapse repeated spaces
+    s = (s or "").strip()
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s if len(s) <= max_len else (s[: max_len - 1].rstrip() + "…")
+
+def morkcore_edge_line() -> str:
+    """
+    OPTIONAL helper. Only used if you explicitly want to pull raw edge lines.
+    If you're routing all tone through Core, you usually don't need this.
+    """
+    try:
+        base = _core_base_url()
+        r = requests.get(
+            f"{base}/memory/query",
+            params={"q": "edge=", "limit": 10},
+            timeout=3,
+        )
+        if not r.ok:
+            return ""
+        data = r.json()
+        items = data.get("items", []) if isinstance(data, dict) else []
+        for it in items:
+            c = (it or {}).get("content", "")
+            if isinstance(c, str) and "| edge=" in c:
+                return c.strip()
+    except Exception:
+        pass
+    return ""
+
+def compose_observation_from_core(max_len: int = 260) -> str:
+    """
+    Ask Mork Core to compose an observation tweet.
+    All voice/tone comes from Core (and its prime directive).
+    Never throws.
+    """
+    try:
+        out = core_compose_payload({"kind": "observation", "maxChars": max_len}, timeout=8)
+        if out:
+            return _wrap_280(out, max_len)
+    except Exception:
+        pass
+
+    # Hard fallback (should be rare): keep neutral, avoid the repetitive "edge/vibes" stuff here.
+    return _wrap_280("System check: my thoughts are quiet right now. Give me a moment to warm the coals.", max_len)
+
+
+# ----------------------------------------
+# Relationship memory (local file) — keep
+# ----------------------------------------
+
+def _load_relationships():
+    if os.path.exists(REL_FILE):
+        try:
+            with open(REL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_relationships(rel):
+    try:
+        with open(REL_FILE, "w", encoding="utf-8") as f:
+            json.dump(rel, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _extract_topics(text: str, max_topics=5):
+    t = re.sub(r"http\S+", "", (text or "").lower())
+    words = re.findall(r"[a-z0-9']{3,}", t)
+
+    stop = {
+        "this","that","with","have","just","like","your","youre","about","from","they","them","what",
+        "when","then","been","were","there","here","will","would","could","into","over","under","than",
+        "more","some","much","very","really","also","because","while","where","their","them","these",
+        "those","cant","dont","didnt","doesnt","isnt","arent","you","and","the","for"
+    }
+
+    freq = defaultdict(int)
+    for w in words:
+        if w in stop:
+            continue
+        freq[w] += 1
+
+    ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    return [w for w, _ in ranked[:max_topics]]
+
+def update_relationship(author_id: str, username: str, text: str, engagement_score: float = 0.0):
+    rel = _load_relationships()
+    key = author_id or username or "unknown"
+    now = datetime.now(timezone.utc).isoformat()
+
+    entry = rel.get(key, {
+        "author_id": author_id,
+        "username": username,
+        "trust": 0.0,
+        "topics": [],
+        "last_interaction": None,
+        "interactions": 0,
+    })
+
+    entry["author_id"] = author_id or entry.get("author_id")
+    entry["username"] = username or entry.get("username")
+    entry["last_interaction"] = now
+    entry["interactions"] = int(entry.get("interactions", 0)) + 1
+
+    bump = 0.05 + min(0.05, float(engagement_score) / 100.0)
+    entry["trust"] = max(-1.0, min(1.0, float(entry.get("trust", 0.0)) + bump))
+
+    new_topics = _extract_topics(text)
+    topics = list(entry.get("topics", []))
+    for t in new_topics:
+        if t not in topics:
+            topics.insert(0, t)
+    entry["topics"] = topics[:15]
+
+    rel[key] = entry
+    _save_relationships(rel)
+    return entry
+
 def _load_reply_state():
     if os.path.exists(REPLY_STATE_FILE):
-        with open(REPLY_STATE_FILE, "r") as f:
+        with open(REPLY_STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {"last_post_day": None, "replied_today": 0, "since_id": None, "backlog": []}
 
 def _save_reply_state(s):
-    with open(REPLY_STATE_FILE, "w") as f:
+    with open(REPLY_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
 
 def _parse_iso_z(ts: str) -> datetime:
@@ -46,14 +260,12 @@ def _age_hours(created_at: str) -> float:
     return (datetime.now(timezone.utc) - _parse_iso_z(created_at)).total_seconds() / 3600.0
 
 def _score(public_metrics: dict) -> float:
-    # Simple quality score; tweak as desired
     likes = public_metrics.get("like_count", 0)
     replies = public_metrics.get("reply_count", 0)
     rts = public_metrics.get("retweet_count", 0)
     return likes + 2 * replies + 0.5 * rts
 
 def _prune_backlog(backlog: list) -> list:
-    # Keep only unique tweet_ids that are still <23h; cap size
     seen = set()
     kept = []
     for item in backlog:
@@ -65,8 +277,6 @@ def _prune_backlog(backlog: list) -> list:
             seen.add(tid)
             kept.append(item)
     return kept[:MAX_BACKLOG]
-import random
-
 # Inside class TwitterBot
 def _normalize_story(self, story, subject=None):
     """
@@ -77,30 +287,28 @@ def _normalize_story(self, story, subject=None):
         return {
             "title": (subject or "Update").title(),
             "preview": story,
-            "url": "#"
+            "url": "#",
         }
+
     if isinstance(story, dict):
         return {
-            "title": story.get("title") or (subject or "Update").title(),
-            "preview": story.get("preview") or story.get("summary") or story.get("text") or "",
-            "url": story.get("url") or story.get("link") or "#",
+            "title": (story.get("title") or (subject or "Update").title()).strip(),
+            "preview": (story.get("preview") or story.get("summary") or story.get("text") or "").strip(),
+            "url": (story.get("url") or story.get("link") or "#").strip(),
         }
-    # Unknown shape
-    return {
-        "title": (subject or "Update").title(),
-        "preview": "",
-        "url": "#"
-    }
+
+    return {"title": (subject or "Update").title(), "preview": "", "url": "#"}
+
 def _normalize_subject(self, subj):
-    import random
     if not subj:
         return "news"
+
     s = str(subj).strip()
-    # treat these as "random"
-    if s.lower() in {"surprise_all", "random", "any", "*"}:
+    if s.lower() in {"surprise_all", "surprise-all", "random", "any", "*"}:
         pool = list(getattr(self, "feed_config", {}).keys()) or list(RSS_FEEDS.keys())
-        pool = [k for k in pool if k.lower() not in {"surprise_all", "random"}]
+        pool = [k for k in pool if k.lower() not in {"surprise_all", "surprise-all", "random"}]
         return random.choice(pool) if pool else "news"
+
     return s
 
 def get_random_story_all(self, subject=None):
@@ -109,26 +317,20 @@ def get_random_story_all(self, subject=None):
     Tries a few likely single/bulk fetchers if they exist.
     If nothing is available, returns a small synthetic story so cadence never stalls.
     """
-    subject = subject or getattr(self, "scheduler_subject", None) or "news"
+    # ✅ normalize subject so "surprise_all" actually fans out
+    subject = self._normalize_subject(subject or getattr(self, "scheduler_subject", None) or "news")
 
     def norm(st):
-        # Normalize various shapes to a {title, preview, url} dict
-        if isinstance(st, str):
-            return {"title": subject.title(), "preview": st, "url": "#"}
-        if isinstance(st, dict):
-            title = (st.get("title") or "").strip() or subject.title()
-            preview = (st.get("preview") or st.get("summary") or st.get("text") or "").strip()
-            url = (st.get("url") or st.get("link") or "#").strip()
-            return {"title": title, "preview": preview, "url": url}
-        return {"title": subject.title(), "preview": "", "url": "#"}
+        return self._normalize_story(st, subject=subject)
 
     # 1) Try single-story fetchers (if you’ve implemented any)
     single_candidates = [
-        "get_news_story",            # returns dict/str for a subject
-        "get_new_story_from_feeds",  # your RSS aggregator (single)
-        "fetch_next_story",          # iterator-like
-        "fetch_story",               # generic
-        "get_story_from_rss",        # rss-specific
+        "get_news_story",
+        "get_new_story_from_feeds",
+        "fetch_next_story",
+        "fetch_story",
+        "get_story_from_rss",
+        "get_random_story_from",   # ✅ include the helper below if you keep it
     ]
     for name in single_candidates:
         if hasattr(self, name):
@@ -144,15 +346,14 @@ def get_random_story_all(self, subject=None):
 
     # 2) Try bulk fetchers (pick one at random)
     bulk_candidates = [
-        "fetch_news_stories",   # should return list[dict or str]
-        "get_stories_for_topic"
+        "fetch_news_stories",
+        "get_stories_for_topic",
     ]
     for name in bulk_candidates:
         if hasattr(self, name):
             try:
                 stories = getattr(self, name)(subject) or []
                 if stories:
-                    import random
                     ns = norm(random.choice(stories))
                     print(f"[get_random_story_all] Using random from {name}()")
                     return ns
@@ -160,15 +361,61 @@ def get_random_story_all(self, subject=None):
                 print(f"[get_random_story_all] {name}() failed: {e}")
 
     # 3) Synthetic fallback so the queue is never empty
-    from datetime import datetime
     ts = datetime.now().strftime("%b %d, %Y %I:%M %p")
     print("[get_random_story_all] No concrete source found; returning fallback story.")
     return {
         "title": f"{subject.title()} update — {ts}",
         "preview": f"Quick thought on {subject}. (auto-generated fallback)",
-        "url": "#"
+        "url": "#",
     }
+def get_random_story_from(self, categories=None):
+    """
+    Returns a normalized dict: {title, preview, url}
+    categories: list[str] or None => all categories
+    """
+    cats = []
+    if not categories:
+        cats = list(RSS_FEEDS.keys())
+    else:
+        cats = [str(c).strip().lower() for c in categories if str(c).strip()]
 
+    feeds = []
+    for c in cats:
+        bucket = RSS_FEEDS.get(c)
+        if not isinstance(bucket, dict):
+            continue
+        for tier in ("primary", "secondary"):
+            lst = bucket.get(tier, [])
+            if isinstance(lst, list):
+                for f in lst:
+                    if isinstance(f, dict) and f.get("url"):
+                        feeds.append(f)
+
+    if not feeds:
+        return None
+
+    for _ in range(6):
+        f = random.choice(feeds)
+        url = f.get("url", "")
+        name = f.get("name", "RSS")
+
+        try:
+            feed = feedparser.parse(url)
+            if getattr(feed, "entries", None):
+                entry = random.choice(feed.entries[:10])
+                title = getattr(entry, "title", "(untitled)")
+                link = getattr(entry, "link", "") or getattr(entry, "id", "") or ""
+                preview = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+                story = {
+                    "title": f"{title} ({name})",
+                    "preview": preview.strip(),
+                    "url": link.strip() or url,
+                }
+                return self._normalize_story(story, subject=(cats[0] if cats else "news"))
+        except Exception as e:
+            print(f"[get_random_story_from] parse failed ({name}): {e}")
+
+    return None
 
 # Constants
 ENCRYPTION_KEY_FILE = "encryption.key"
@@ -248,7 +495,7 @@ RSS_FEEDS = {
             {"url": "https://www.theblock.co/rss.xml", "name": "The Block"},
             {"url": "https://blog.kraken.com/feed", "name": "Kraken Blog"},
             {"url": "https://messari.io/rss", "name": "Messari"},
-            {"url": "https://blockworks.co/feed", "name": "Blockworks"}       
+            {"url": "https://blockworks.co/feed", "name": "Blockworks"}
         ],
         "secondary": [
             {"url": "https://cointelegraph.com/rss", "name": "CoinTelegraph"},
@@ -296,56 +543,90 @@ RSS_FEEDS = {
             {"name": "The Next Web", "url": "https://thenextweb.com/feed"},
         ]
 },
+
 }
 def get_random_story_from(categories=None):
-    # categories: list[str] or None => all
-    pool = []
+    """
+    Returns a string like:
+      "Title — link  (source: Feed Name)"
+    Supports your RSS_FEEDS structure:
+      RSS_FEEDS["crypto"]["primary"] = [{"url": "...", "name": "..."}]
+    categories: list[str] or None => all categories
+    """
+    cats = []
     if not categories:
-        # all categories
-        for lst in RSS_FEEDS.values():
-            pool.extend(lst)
+        cats = list(RSS_FEEDS.keys())
     else:
-        for c in categories:
-            pool.extend(RSS_FEEDS.get(c.lower(), []))
+        cats = [str(c).strip().lower() for c in categories if str(c).strip()]
+
+    pool = []
+    for c in cats:
+        bucket = RSS_FEEDS.get(c)
+        if not isinstance(bucket, dict):
+            continue
+        for tier in ("primary", "secondary"):
+            lst = bucket.get(tier, [])
+            if isinstance(lst, list):
+                for f in lst:
+                    if isinstance(f, dict) and f.get("url"):
+                        pool.append(f)
+
     if not pool:
         return None
-    for _ in range(4):
-        name, url = random.choice(pool)
-        feed = feedparser.parse(url)
-        if feed.entries:
-            entry = random.choice(feed.entries[:10])  # top few items
-            title = getattr(entry, "title", "(untitled)")
-            link = getattr(entry, "link", "")
-            return f"{title} — {link}  \n(source: {name})"
+
+    for _ in range(6):
+        f = random.choice(pool)
+        url = f.get("url", "")
+        name = f.get("name", "RSS")
+
+        try:
+            feed = feedparser.parse(url)
+            entries = getattr(feed, "entries", None) or []
+            if entries:
+                entry = random.choice(entries[:10])
+                title = getattr(entry, "title", "(untitled)")
+                link = getattr(entry, "link", "") or getattr(entry, "id", "") or ""
+                return f"{title} — {link}\n(source: {name})"
+        except Exception:
+            continue
+
     return None
+
 class EncryptionManager:
     def __init__(self):
         self.key = None
+        self.cipher = None
         print("Initializing EncryptionManager...")
+
         if os.path.exists(ENCRYPTION_KEY_FILE):
             try:
-                with open(ENCRYPTION_KEY_FILE, 'rb') as f:
+                with open(ENCRYPTION_KEY_FILE, "rb") as f:
                     self.key = f.read()
-                    print(f"Loaded encryption key, length: {len(self.key)} bytes")
-                    self.cipher = Fernet(self.key)
-                    print("Successfully created Fernet cipher")
+                print(f"Loaded encryption key, length: {len(self.key)} bytes")
+                self.cipher = Fernet(self.key)
+                print("Successfully created Fernet cipher")
             except Exception as e:
                 print(f"Error loading encryption key: {e}")
                 traceback.print_exc()
                 self.key = None
-        if self.key:
+                self.cipher = None
+
+        if self.key and self.cipher:
             self.validate_key()
-        if not self.key:
+
+        if not self.key or not self.cipher:
             print("Generating new encryption key...")
             self.key = Fernet.generate_key()
             try:
-                with open(ENCRYPTION_KEY_FILE, 'wb') as f:
+                with open(ENCRYPTION_KEY_FILE, "wb") as f:
                     f.write(self.key)
                 self.cipher = Fernet(self.key)
                 print("Successfully generated and saved new key")
             except Exception as e:
                 print(f"Error saving new encryption key: {e}")
- 
+                self.key = None
+                self.cipher = None
+
     def validate_key(self):
         try:
             test_cipher = Fernet(self.key)
@@ -359,31 +640,29 @@ class EncryptionManager:
             traceback.print_exc()
 
     def encrypt(self, data):
+        if not self.cipher:
+            print("Error encrypting data: cipher not initialized")
+            return None
         try:
             json_data = json.dumps(data)
-            print(f"Encrypting data, JSON length: {len(json_data)}")
             encrypted = self.cipher.encrypt(json_data.encode())
-            print(f"Successfully encrypted, length: {len(encrypted)} bytes")
             return encrypted
         except Exception as e:
             print(f"Error encrypting data: {e}")
             return None
 
     def decrypt(self, encrypted_data):
+        if not self.cipher:
+            print("Error decrypting data: cipher not initialized")
+            return {}
         try:
-            print(f"Attempting to decrypt data, length: {len(encrypted_data)} bytes")
             decrypted = self.cipher.decrypt(encrypted_data)
-            print("Successfully decrypted data")
-            json_data = json.loads(decrypted.decode())
-            print(f"Successfully parsed JSON, keys: {list(json_data.keys()) if isinstance(json_data, dict) else 'not a dict'}")
-            return json_data
+            return json.loads(decrypted.decode())
         except Exception as e:
             print(f"Error decrypting data: {e}")
             traceback.print_exc()
             return {}
 
-if __name__ == "__main__":
-    manager = EncryptionManager()
 
 class CryptoArticle:
     def __init__(self, title, preview, full_text, link, published_date):
@@ -392,109 +671,174 @@ class CryptoArticle:
         self.full_text = full_text
         self.link = link
         self.published_date = published_date
-    
+
     def get_topic_text(self):
         return f"{self.title}\n\n{self.preview}"
+
 
 class TwitterBot:
     def __init__(self):
         print("\n=== Initializing TwitterBot ===")
         self.encryption_manager = EncryptionManager()
+
         self.credentials = {}
         self.characters = {}
-        self.feed_config = {}  # Store feed selection configuration
+        self.feed_config = {}
+
+        # Scheduler state
         self.scheduler_running = False
-        self.current_topic = ""
-        self.feed_index = 0
+        self.scheduler_character = None
+        self.scheduler_subject = "crypto"
+        self.reply_bank = []
+        self.last_daily_reply_date = None
+
+        # Tweet cadence state
         self.tweet_queue = queue.Queue()
-        self.tweet_count = 0
-        self.last_tweet_time = None
-        self.used_stories = set()  # Track used story URLs
-        self.recent_topics = []    # Track recent topic keywords
-        self.MAX_RECENT_TOPICS = 50  # Keep track of last 50 topics
-        self.feed_errors = defaultdict(int)  # Track feed errors
-        self.feed_last_used = {}  # Track when each feed was last used
         self.last_successful_tweet = None
-        self.twitter_client = None  # Initialize Twitter client as None
+        self.last_observation_time = None
         self.backoff_until = None
 
+        # Feed/memory state
+        self.current_topic = ""
+        self.feed_index = 0
+        self.used_stories = set()
+        self.recent_topics = []
+        self.MAX_RECENT_TOPICS = 50
+        self.feed_errors = defaultdict(int)
+        self.feed_last_used = {}
+
+        # Clients
+        self.twitter_client = None
+        self.client = None  # OpenAI client (optional)
+
+        # Meme system
         self.use_memes = False
         self.meme_counter = 0
-        self.meme_frequency = 5  # Default: post meme every 5 tweets
-        self.used_memes = set()  # Track recently used memes
+        self.meme_frequency = 5
+        self.used_memes = set()
 
-        if not os.path.exists('memes'):
-            os.makedirs('memes')
-        
+        if not os.path.exists("memes"):
+            os.makedirs("memes")
+
+        # Rate limit tracking
         self.rate_limits = TWITTER_RATE_LIMITS.copy()
-        
+
         print("\n=== Loading Initial Data ===")
         self.credentials = self.load_credentials()
         print(f"Loaded credentials: {json.dumps(self.credentials, indent=2)}")
-        
+
         self.characters = self.load_characters()
         print(f"Loaded characters: {json.dumps(self.characters, indent=2)}")
-        
+
         self.feed_config = self.load_feed_config()
         print(f"Loaded feed configuration: {json.dumps(self.feed_config, indent=2)}")
-        
-        if self.credentials.get('openai_key'):
+
+        # Initialize OpenAI client ONLY if enabled
+        if USE_OPENAI and self.credentials.get("openai_key"):
             self.client = OpenAI(
-                api_key=self.credentials['openai_key'],
+                api_key=self.credentials["openai_key"],
                 http_client=httpx.Client(
                     base_url="https://api.openai.com/v1",
                     follow_redirects=True,
-                    timeout=60.0
-                )
+                    timeout=60.0,
+                ),
             )
-        
-        if all(key in self.credentials for key in ['twitter_api_key', 'twitter_api_secret', 'twitter_access_token', 'twitter_access_token_secret']):
+            print("OpenAI client initialized (USE_OPENAI enabled).")
+        else:
+            if self.credentials.get("openai_key") and not USE_OPENAI:
+                print("OpenAI key present, but USE_OPENAI is disabled — skipping OpenAI client init.")
+            else:
+                print("OpenAI client disabled or missing key.")
+
+        # Initialize Twitter client if credentials present
+        if all(k in self.credentials for k in [
+            "twitter_api_key",
+            "twitter_api_secret",
+            "twitter_access_token",
+            "twitter_access_token_secret",
+        ]):
             self.twitter_client = tweepy.Client(
-                consumer_key=self.credentials['twitter_api_key'],
-                consumer_secret=self.credentials['twitter_api_secret'],
-                access_token=self.credentials['twitter_access_token'],
-                access_token_secret=self.credentials['twitter_access_token_secret']
+                consumer_key=self.credentials["twitter_api_key"],
+                consumer_secret=self.credentials["twitter_api_secret"],
+                access_token=self.credentials["twitter_access_token"],
+                access_token_secret=self.credentials["twitter_access_token_secret"],
             )
+            print("Twitter client initialized.")
+        else:
+            print("Twitter client NOT initialized (missing X credentials).")
+
     def _normalize_subject(self, subject):
         """
         Map placeholders like 'Surprise_All'/'random' to a real subject from feed_config or RSS_FEEDS.
+        Returns the canonical key (preserve original keys when possible).
         """
-        import random
-        s = (str(subject).strip() if subject else "").lower()
-        if not s or s in {"surprise_all", "__surprise_all__", "random", "any", "all", "*"}:
-            # Prefer configured subjects; fall back to RSS_FEEDS keys; finally to a sane default.
+        s_raw = (str(subject).strip() if subject else "")
+        s = s_raw.lower()
+
+        if not s or s in {"surprise_all", "__surprise_all__", "surprise-all", "random", "any", "all", "*"}:
             pool = list(getattr(self, "feed_config", {}).keys())
-            if not pool and "RSS_FEEDS" in globals():
+            if not pool:
                 pool = list(RSS_FEEDS.keys())
-            pool = [k for k in pool if k and k.lower() not in {"surprise_all", "random", "__surprise_all__", "any", "all", "*"}]
-            return (random.choice(pool) if pool else "news")
-        return s
+
+            pool = [k for k in pool if k and str(k).lower() not in {
+                "surprise_all", "__surprise_all__", "surprise-all", "random", "any", "all", "*"
+            }]
+            return random.choice(pool) if pool else "news"
+
+        # If user gave "AI" but keys are "ai", normalize to existing key
+        if "RSS_FEEDS" in globals():
+            for k in RSS_FEEDS.keys():
+                if str(k).lower() == s:
+                    return k
+
+        if hasattr(self, "feed_config") and isinstance(self.feed_config, dict):
+            for k in self.feed_config.keys():
+                if str(k).lower() == s:
+                    return k
+
+        return s_raw or "news"
 
     def scheduler_worker(self):
         print("\n🛠️ Starting scheduler worker...")
 
+        # Persist character/subject for auto-refill later
         self.scheduler_character = getattr(self, "scheduler_character", None)
         self.scheduler_subject = getattr(self, "scheduler_subject", "crypto")
 
+        # State for cadence + daily reply window
         self.reply_bank = getattr(self, "reply_bank", [])
         self.last_daily_reply_date = getattr(self, "last_daily_reply_date", None)
+        self.last_observation_time = getattr(self, "last_observation_time", None)
 
-        if not self.last_successful_tweet:
+        # If never tweeted successfully, don't wait 4 hours on first run
+        if not getattr(self, "last_successful_tweet", None):
             print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
             self.last_successful_tweet = datetime.now()
+        # Prevent an immediate observation tweet right after startup / meme post
+        if self.last_observation_time is None:
+            self.last_observation_time = datetime.now()
+
+        OBS_INTERVAL = timedelta(hours=3)
+        MAIN_TWEET_INTERVAL_SEC = 4 * 3600
 
         while self.scheduler_running:
             try:
+                # Respect any backoff
                 if self.backoff_until and datetime.now() < self.backoff_until:
                     wait_seconds = (self.backoff_until - datetime.now()).total_seconds()
-                    print(f"⏳ Backoff active until {self.backoff_until}. Sleeping {wait_seconds/60:.1f} minutes...")
+                    print(
+                        f"⏳ Backoff active until {self.backoff_until}. "
+                        f"Sleeping {wait_seconds/60:.1f} minutes..."
+                    )
                     time.sleep(min(60, max(1, wait_seconds)))
                     continue
 
                 now = datetime.now()
 
+                # === (1) Daily replies at ~10:00 AM ===
                 ten_am_today = now.replace(hour=10, minute=0, second=0, microsecond=0)
-                if (self.last_daily_reply_date != now.date()) and (now >= ten_am_today):
+
+                if self.last_daily_reply_date != now.date() and now >= ten_am_today:
                     print("\n📬 10:00 AM reached — checking mentions and replying to up to 2…")
                     handled = 0
 
@@ -505,82 +849,109 @@ class TwitterBot:
                         self.reply_bank = []
 
                     if not pending:
-                        fetched = []
                         try:
                             if hasattr(self, "collect_unreplied_mentions"):
-                                fetched = self.collect_unreplied_mentions() or []
+                                pending = self.collect_unreplied_mentions() or []
                             elif hasattr(self, "fetch_recent_mentions"):
-                                fetched = self.fetch_recent_mentions() or []
+                                pending = self.fetch_recent_mentions() or []
                             elif hasattr(self, "monitor_and_reply_to_mentions"):
-                                print("⚠ Using monitor_and_reply_to_mentions() fallback (may reply to more than 2).")
+                                print("⚠ Using monitor_and_reply_to_mentions fallback.")
                                 self.monitor_and_reply_to_mentions()
-                                fetched = []
+                                pending = []
                             else:
                                 print("⚠ No mention-collection method found.")
-                                fetched = []
+                                pending = []
                         except Exception as e:
                             print(f"❌ Error fetching mentions: {e}")
-                            fetched = []
-                        pending.extend(fetched)
+                            pending = []
 
                     for m in pending:
-                        if handled < 2:
-                            try:
-                                if hasattr(self, "reply_to_mention"):
-                                    self.reply_to_mention(m)
-                                    handled += 1
-                                elif hasattr(self, "reply_to_engagement"):
-                                    self.reply_to_engagement(m)
-                                    handled += 1
-                                else:
-                                    self.reply_bank.append(m)
-                                    print("⚠ No single-mention reply method; banking this mention.")
-                            except Exception as e:
-                                print(f"❌ Failed replying to a mention: {e}")
-                        else:
+                        if handled >= 2:
+                            self.reply_bank.append(m)
+                            continue
+                        try:
+                            if hasattr(self, "reply_to_mention"):
+                                self.reply_to_mention(m)
+                                handled += 1
+                            elif hasattr(self, "reply_to_engagement"):
+                                self.reply_to_engagement(m)
+                                handled += 1
+                            else:
+                                self.reply_bank.append(m)
+                        except Exception as e:
+                            print(f"❌ Failed replying to a mention: {e}")
                             self.reply_bank.append(m)
 
-                    print(f"✅ Replied to {handled} mention(s). Banked {len(self.reply_bank)} leftover(s).")
+                    print(
+                        f"✅ Replied to {handled} mention(s). "
+                        f"Banked {len(self.reply_bank)} leftover(s)."
+                    )
                     self.last_daily_reply_date = now.date()
 
-                if (now - self.last_successful_tweet).total_seconds() >= (4 * 3600):
+                # === (2) Periodic Mork Core observation (Option 3.B) ===
+                if self.last_observation_time is None or (now - self.last_observation_time) >= OBS_INTERVAL:
+                    try:
+                        # reflect (optional, but useful)
+                        did_reflect = False
+                        try:
+                            did_reflect = core_reflect(timeout=6)
+                        except Exception as e:
+                            print(f"⚠ core_reflect failed: {e}")
+                        print(f"🧠 core_reflect: {did_reflect}")
+
+                        # ask Core to compose an "observation/reflection" style tweet
+                        obs = ""
+                        try:
+                            obs = core_compose_payload({"kind": "reflection", "maxChars": 260}, timeout=10)
+                            if not obs:
+                                obs = core_compose_payload({"kind": "arb", "maxChars": 260}, timeout=10)
+                            if not obs:
+                                obs = core_compose_payload({"kind": "observation", "maxChars": 260}, timeout=10)
+                        except Exception as e:
+                            print(f"⚠ core compose failed: {e}")
+                            obs = ""
+
+                        if obs:
+                            print("🧠 Posting Mork Core observation…")
+                            ok = self.send_tweet(obs)
+                            if ok:
+                                self.last_observation_time = now
+                                time.sleep(random.uniform(5, 12))
+                            else:
+                                print("⚠ Observation tweet send failed (send_tweet returned false).")
+                        else:
+                            print("⚠ Core returned empty composed tweet (/x/compose).")
+
+                    except Exception as e:
+                        print(f"⚠ Observation tweet failed: {e}")
+
+                # === (3) Main tweet every 4 hours ===
+                due_for_main = (now - self.last_successful_tweet).total_seconds() >= MAIN_TWEET_INTERVAL_SEC
+
+                if due_for_main:
                     print("\n⏰ 4 hours passed — preparing to send next tweet...")
 
                     if not self.tweet_queue.empty():
                         character, story_text, subject = self.tweet_queue.get()
                         tweet_text = self.generate_tweet(character, story_text)
+
                         if tweet_text and self.send_tweet(tweet_text):
                             print("✅ Tweet from queue sent.")
                             self.last_successful_tweet = datetime.now()
-
-                            next_story = self.get_new_story(subject)
-                            if next_story:
-                                next_text = f"{next_story['title']}\n\n{next_story.get('preview','')}\n\nRead more: {next_story['url']}"
-                                self.tweet_queue.put((character, next_text, subject))
-
-                            if self.tweet_queue.qsize() < 2:
-                                to_add = 3 - self.tweet_queue.qsize()
-                                added = 0
-                                for _ in range(to_add):
-                                    s = self.get_new_story(subject)
-                                    if not s:
-                                        break
-                                    txt = f"{s['title']}\n\n{s.get('preview','')}\n\nRead more: {s['url']}"
-                                    self.tweet_queue.put((character, txt, subject))
-                                    added += 1
-                                if added:
-                                    print(f"🔄 Topped up queue with {added} story(ies).")
                         else:
                             print("❌ Failed to send tweet from queue.")
                     else:
                         print("📭 Tweet queue is empty — trying to refill...")
-                        # 🔁 Seed up to 3 items when empty
                         seeded = 0
                         for _ in range(3):
                             s = self.get_new_story(self.scheduler_subject)
                             if not s:
                                 break
-                            txt = f"{s['title']}\n\n{s.get('preview','')}\n\nRead more: {s['url']}"
+                            txt = (
+                                f"{s['title']}\n\n"
+                                f"{s.get('preview','')}\n\n"
+                                f"Read more: {s['url']}"
+                            )
                             self.tweet_queue.put((self.scheduler_character, txt, self.scheduler_subject))
                             seeded += 1
                         print(f"📥 Refilled with {seeded} story(ies).")
@@ -597,10 +968,12 @@ class TwitterBot:
         Tries feedparser; falls back to requests + XML.
         """
         items = []
+
+        # 1) feedparser path
         try:
-            import feedparser  # pip install feedparser (recommended)
+            import feedparser
             d = feedparser.parse(url)
-            for e in d.entries[:limit]:
+            for e in (d.entries or [])[:limit]:
                 title = (e.get("title") or "").strip()
                 link = (e.get("link") or "#").strip()
                 summary = (e.get("summary") or e.get("description") or "").strip()
@@ -611,26 +984,36 @@ class TwitterBot:
         except Exception as e:
             print(f"[get_stories_from_feed] feedparser error for {url}: {e}")
 
+        # 2) fallback XML path
         try:
-            import re, html, requests, xml.etree.ElementTree as ET  # ensure requests installed
-            r = requests.get(url, timeout=10)
+            import re, html, requests, xml.etree.ElementTree as ET
+            r = requests.get(url, timeout=10, headers=DEFAULT_HEADERS if "DEFAULT_HEADERS" in globals() else None)
             r.raise_for_status()
+
             root = ET.fromstring(r.content)
-            for it in root.findall(".//item")[:limit]:  # RSS
+
+            # RSS
+            for it in root.findall(".//item")[:limit]:
                 title = (it.findtext("title") or "").strip()
                 link = (it.findtext("link") or "#").strip()
                 desc = (it.findtext("description") or "").strip()
                 desc = html.unescape(re.sub(r"<[^>]+>", "", desc))
                 if title or desc:
                     items.append({"title": title, "preview": desc, "url": link})
-            if not items:  # Atom fallback
-                ns = {"a": "http://www.w3.org/2005/Atom"}
-                for it in root.findall(".//a:entry", ns)[:limit]:
-                    title = (it.findtext("a:title", default="", namespaces=ns) or "").strip()
-                    link_el = it.find("a:link", ns)
-                    link = link_el.get("href", "#").strip() if link_el is not None else "#"
-                    desc = (it.findtext("a:summary", default="", namespaces=ns) or "").strip()
+
+            if items:
+                return items
+
+            # Atom
+            ns = {"a": "http://www.w3.org/2005/Atom"}
+            for it in root.findall(".//a:entry", ns)[:limit]:
+                title = (it.findtext("a:title", default="", namespaces=ns) or "").strip()
+                link_el = it.find("a:link", ns)
+                link = link_el.get("href", "#").strip() if link_el is not None else "#"
+                desc = (it.findtext("a:summary", default="", namespaces=ns) or "").strip()
+                if title or desc:
                     items.append({"title": title, "preview": desc, "url": link})
+
         except Exception as e:
             print(f"[get_stories_from_feed] fallback error for {url}: {e}")
 
@@ -642,90 +1025,105 @@ class TwitterBot:
             print("No credentials file found")
             return {}
         try:
-            with open(CREDENTIALS_FILE, 'rb') as f:
+            with open(CREDENTIALS_FILE, "rb") as f:
                 data = f.read()
-                print(f"Read credentials file, size: {len(data)} bytes")
-                if not data:
-                    print("Empty credentials file")
-                    return {}
-                print("Attempting to decrypt credentials...")
-                decrypted = self.encryption_manager.decrypt(data)
-                if not decrypted:
-                    print("Failed to decrypt credentials")
-                    return {}
-                print(f"Successfully loaded credentials with keys: {list(decrypted.keys())}")
-                return decrypted
+            print(f"Read credentials file, size: {len(data)} bytes")
+            if not data:
+                print("Empty credentials file")
+                return {}
+
+            print("Attempting to decrypt credentials...")
+            decrypted = self.encryption_manager.decrypt(data) or {}
+            if not isinstance(decrypted, dict) or not decrypted:
+                print("Failed to decrypt credentials")
+                return {}
+
+            print(f"Successfully loaded credentials with keys: {list(decrypted.keys())}")
+            return decrypted
         except Exception as e:
             print(f"Error loading credentials: {e}")
             import traceback
             traceback.print_exc()
             return {}
-    
+
     def load_characters(self):
         print("\nLoading characters...")
         if not os.path.exists(CHARACTERS_FILE):
             print("No characters file found")
             return {}
         try:
-            with open(CHARACTERS_FILE, 'rb') as f:
+            with open(CHARACTERS_FILE, "rb") as f:
                 data = f.read()
-                print(f"Read characters file, size: {len(data)} bytes")
-                if not data:
-                    print("Empty characters file")
-                    return {}
-                print("Attempting to decrypt characters...")
-                decrypted = self.encryption_manager.decrypt(data)
-                if not decrypted:
-                    print("Failed to decrypt characters")
-                    return {}
-                print(f"Successfully loaded characters with keys: {list(decrypted.keys())}")
-                return decrypted
+            print(f"Read characters file, size: {len(data)} bytes")
+            if not data:
+                print("Empty characters file")
+                return {}
+
+            print("Attempting to decrypt characters...")
+            decrypted = self.encryption_manager.decrypt(data) or {}
+            if not isinstance(decrypted, dict) or not decrypted:
+                print("Failed to decrypt characters")
+                return {}
+
+            print(f"Successfully loaded characters with keys: {list(decrypted.keys())}")
+            return decrypted
         except Exception as e:
             print(f"Error loading characters: {e}")
             import traceback
             traceback.print_exc()
             return {}
-    
+
     def save_credentials(self, credentials):
         print("\nSaving credentials to file...")
         print(f"Credentials to save: {list(credentials.keys())}")
         try:
             print("Encrypting credentials...")
             encrypted_data = self.encryption_manager.encrypt(credentials)
-            if encrypted_data:
-                print(f"Encrypted data length: {len(encrypted_data)} bytes")
-                print("Writing to file...")
-                with open(CREDENTIALS_FILE, 'wb') as f:
-                    f.write(encrypted_data)
-                self.credentials = credentials
-                print("Updated bot credentials in memory")
-                
-                # Update OpenAI client if key provided
-                if credentials.get('openai_key'):
-                    print("Initializing OpenAI client...")
-                    self.client = OpenAI(
-                        api_key=credentials['openai_key'],
-                        http_client=httpx.Client(
-                            base_url="https://api.openai.com/v1",
-                            follow_redirects=True,
-                            timeout=60.0
-                        )
-                    )
-                    print("OpenAI client initialized")
-                
-                if all(key in credentials for key in ['twitter_api_key', 'twitter_api_secret', 'twitter_access_token', 'twitter_access_token_secret']):
-                    print("Initializing Twitter client...")
-                    self.twitter_client = tweepy.Client(
-                        consumer_key=credentials['twitter_api_key'],
-                        consumer_secret=credentials['twitter_api_secret'],
-                        access_token=credentials['twitter_access_token'],
-                        access_token_secret=credentials['twitter_access_token_secret']
-                    )
-                    print("Twitter client initialized")
-                
-                return True
-            print("Failed to encrypt credentials")
-            return False
+            if not encrypted_data:
+                print("Failed to encrypt credentials")
+                return False
+
+            print(f"Encrypted data length: {len(encrypted_data)} bytes")
+            with open(CREDENTIALS_FILE, "wb") as f:
+                f.write(encrypted_data)
+
+            self.credentials = credentials
+            print("Updated bot credentials in memory")
+
+            # OpenAI client ONLY if enabled
+            if USE_OPENAI and credentials.get("openai_key"):
+                print("Initializing OpenAI client...")
+                self.client = OpenAI(
+                    api_key=credentials["openai_key"],
+                    http_client=httpx.Client(
+                        base_url="https://api.openai.com/v1",
+                        follow_redirects=True,
+                        timeout=60.0,
+                    ),
+                )
+                print("OpenAI client initialized")
+            else:
+                self.client = None
+                if credentials.get("openai_key") and not USE_OPENAI:
+                    print("OpenAI key saved, but USE_OPENAI is disabled — client not initialized.")
+
+            # Twitter client if all credentials provided
+            needed = {"twitter_api_key", "twitter_api_secret", "twitter_access_token", "twitter_access_token_secret"}
+            if needed.issubset(set(credentials.keys())):
+                print("Initializing Twitter client...")
+                self.twitter_client = tweepy.Client(
+                    consumer_key=credentials["twitter_api_key"],
+                    consumer_secret=credentials["twitter_api_secret"],
+                    access_token=credentials["twitter_access_token"],
+                    access_token_secret=credentials["twitter_access_token_secret"],
+                )
+                print("Twitter client initialized")
+            else:
+                # keep existing client if you want; or set to None to be strict
+                print("Twitter client not re-initialized (missing one or more X keys).")
+
+            return True
+
         except Exception as e:
             print(f"Error saving credentials: {e}")
             import traceback
@@ -738,57 +1136,63 @@ class TwitterBot:
         try:
             print("Encrypting characters...")
             encrypted_data = self.encryption_manager.encrypt(characters)
-            if encrypted_data:
-                print(f"Encrypted data length: {len(encrypted_data)} bytes")
-                print("Writing to file...")
-                with open(CHARACTERS_FILE, 'wb') as f:
-                    f.write(encrypted_data)
-                self.characters = characters
-                print("Updated bot characters in memory")
-                return True
-            print("Failed to encrypt characters")
-            return False
+            if not encrypted_data:
+                print("Failed to encrypt characters")
+                return False
+
+            print(f"Encrypted data length: {len(encrypted_data)} bytes")
+            with open(CHARACTERS_FILE, "wb") as f:
+                f.write(encrypted_data)
+
+            self.characters = characters
+            print("Updated bot characters in memory")
+            return True
+
         except Exception as e:
             print(f"Error saving characters: {e}")
             import traceback
             traceback.print_exc()
             return False
-    
+
     def get_article_content(self, url):
         try:
-            response = requests.get(url, timeout=10)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            headers = DEFAULT_HEADERS if "DEFAULT_HEADERS" in globals() else None
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
             for script in soup(["script", "style"]):
                 script.decompose()
-            text = soup.get_text(separator='\n', strip=True)
-            return text
-        except:
+            return soup.get_text(separator="\n", strip=True)
+        except Exception:
             return ""
 
     def extract_keywords(self, text):
-        """Extract important keywords from text to track topic diversity"""
-        # Common crypto terms to ignore
-        common_terms = {'crypto', 'blockchain', 'bitcoin', 'ethereum', 'btc', 'eth', 
-                       'cryptocurrency', 'cryptocurrencies', 'token', 'tokens', 'defi',
-                       'market', 'markets', 'trading', 'price', 'prices'}
-        
-        # Split into words and clean
-        words = re.findall(r'\b\w+\b', text.lower())
-        # Remove common terms, short words, and numbers
-        keywords = {word for word in words 
-                   if word not in common_terms 
-                   and len(word) > 3 
-                   and not word.isdigit()}
+        """Extract important keywords from text to track topic diversity."""
+        common_terms = {
+            "crypto","blockchain","bitcoin","ethereum","btc","eth",
+            "cryptocurrency","cryptocurrencies","token","tokens","defi",
+            "market","markets","trading","price","prices"
+        }
+        words = re.findall(r"\b\w+\b", (text or "").lower())
+        keywords = {
+            w for w in words
+            if w not in common_terms and len(w) > 3 and not w.isdigit()
+        }
         return keywords
 
     def is_similar_to_recent(self, title, preview):
-        """Check if a story is too similar to recently posted ones"""
-        # Extract keywords from new story
+        """Check if a story is too similar to recently posted ones."""
         new_keywords = self.extract_keywords(f"{title} {preview}")
+        if not new_keywords:
+            return False
 
-        for recent_keywords in self.recent_topics:
-            # If more than 40% of keywords overlap, consider it too similar
-            overlap = len(new_keywords & recent_keywords) / len(new_keywords | recent_keywords)
+        for recent_keywords in getattr(self, "recent_topics", []) or []:
+            if not recent_keywords:
+                continue
+            denom = len(new_keywords | recent_keywords)
+            if denom == 0:
+                continue
+            overlap = len(new_keywords & recent_keywords) / denom
             if overlap > 0.4:
                 return True
         return False
@@ -796,74 +1200,100 @@ class TwitterBot:
     def get_arxiv_paper_details(self, url):
         """Get detailed information about an arXiv paper including abstract and authors."""
         try:
-            # Convert URL to API URL
-            paper_id = url.split('/')[-1]
-            if 'arxiv.org/abs/' in url:
-                paper_id = url.split('arxiv.org/abs/')[-1]
-            elif 'arxiv.org/pdf/' in url:
-                paper_id = url.split('arxiv.org/pdf/')[-1].replace('.pdf', '')
-            
+            paper_id = url.split("/")[-1]
+            if "arxiv.org/abs/" in url:
+                paper_id = url.split("arxiv.org/abs/")[-1]
+            elif "arxiv.org/pdf/" in url:
+                paper_id = url.split("arxiv.org/pdf/")[-1].replace(".pdf", "")
+
             api_url = f"http://export.arxiv.org/api/query?id_list={paper_id}"
-            
             response = requests.get(api_url, timeout=FEED_TIMEOUT)
             response.raise_for_status()
-            
-            # Parse the XML response
+
             from xml.etree import ElementTree
             root = ElementTree.fromstring(response.content)
-            
-            # arXiv API uses namespaces
-            ns = {
-                'atom': 'http://www.w3.org/2005/Atom',
-                'arxiv': 'http://arxiv.org/schemas/atom'
+
+            ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+            entry = root.find(".//atom:entry", ns)
+            if entry is None:
+                return None
+
+            abstract = (entry.find("atom:summary", ns).text or "").strip()
+            authors = [a.find("atom:name", ns).text for a in entry.findall("atom:author", ns)]
+            categories = [cat.get("term") for cat in entry.findall("atom:category", ns)]
+
+            links = entry.findall("atom:link", ns)
+            html_url = next((lnk.get("href") for lnk in links if lnk.get("type") == "text/html"), None) \
+                    or f"https://arxiv.org/abs/{paper_id}"
+
+            return {
+                "abstract": abstract,
+                "authors": authors,
+                "categories": categories,
+                "html_url": html_url,
+                "paper_id": paper_id,
             }
-            
-            entry = root.find('.//atom:entry', ns)
-            if entry is not None:
-                abstract = entry.find('atom:summary', ns).text.strip()
-                authors = [author.find('atom:name', ns).text for author in entry.findall('atom:author', ns)]
-                categories = [cat.get('term') for cat in entry.findall('atom:category', ns)]
-                
-                # Get HTML link (not PDF) for better preview cards
-                links = entry.findall('atom:link', ns)
-                html_url = next((link.get('href') for link in links if link.get('type') == 'text/html'), None)
-                if not html_url:
-                    # Construct HTML URL from paper ID
-                    html_url = f"https://arxiv.org/abs/{paper_id}"
-                
-                return {
-                    'abstract': abstract,
-                    'authors': authors,
-                    'categories': categories,
-                    'html_url': html_url,
-                    'paper_id': paper_id
-                }
+
         except Exception as e:
             print(f"Error fetching arXiv paper details: {e}")
-        return None
+            return None
 
     def load_feed_config(self):
-        """Load feed configuration from file"""
+        """
+        Load feed configuration.
+        NOTE: Your constants define FEED_CONFIG_FILE as encrypted, but your code uses JSON.
+        We'll support BOTH:
+        - encrypted FEED_CONFIG_FILE (preferred if present)
+        - feed_config.json fallback (legacy)
+        """
+        # 1) preferred: encrypted file
         try:
-            if os.path.exists('feed_config.json'):
-                with open('feed_config.json', 'r') as f:
+            if "FEED_CONFIG_FILE" in globals() and os.path.exists(FEED_CONFIG_FILE):
+                with open(FEED_CONFIG_FILE, "rb") as f:
+                    blob = f.read()
+                cfg = self.encryption_manager.decrypt(blob) or {}
+                if isinstance(cfg, dict):
+                    return cfg
+        except Exception as e:
+            print(f"Error loading encrypted feed config: {e}")
+
+        # 2) legacy json
+        try:
+            if os.path.exists("feed_config.json"):
+                with open("feed_config.json", "r", encoding="utf-8") as f:
                     return json.load(f)
-            return {}
         except Exception as e:
             print(f"Error loading feed configuration: {e}")
-            return {}
-    
+
+        return {}
+
     def save_feed_config(self, config):
-        """Save feed configuration to file"""
+        """
+        Save feed configuration.
+        Writes encrypted FEED_CONFIG_FILE if defined; also updates in-memory self.feed_config.
+        """
+        self.feed_config = config
+
+        # 1) preferred: encrypted
         try:
-            with open('feed_config.json', 'w') as f:
-                json.dump(config, f, indent=2)
-            self.feed_config = config
+            if "FEED_CONFIG_FILE" in globals():
+                encrypted = self.encryption_manager.encrypt(config)
+                if encrypted:
+                    with open(FEED_CONFIG_FILE, "wb") as f:
+                        f.write(encrypted)
+                    return True
+        except Exception as e:
+            print(f"Error saving encrypted feed configuration: {e}")
+
+        # 2) legacy json fallback
+        try:
+            with open("feed_config.json", "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
             print(f"Error saving feed configuration: {e}")
             return False
-    
+
     def get_new_story(self, subject=None):
         """
         Pull the next unused story for a subject from configured RSS_FEEDS/feed_config.
@@ -874,22 +1304,20 @@ class TwitterBot:
 
         # Figure out feed list
         feeds = None
-        if hasattr(self, "feed_config") and self.feed_config:
+        if getattr(self, "feed_config", None):
             feeds = self.feed_config.get(subject)
         if feeds is None and "RSS_FEEDS" in globals():
             feeds = RSS_FEEDS.get(subject)
 
         # Build normalized list of URL strings
-        urls = []
         if isinstance(feeds, dict):
-            raws = []
-            raws.extend(feeds.get("primary", []))
-            raws.extend(feeds.get("secondary", []))
+            raws = list(feeds.get("primary", [])) + list(feeds.get("secondary", []))
         elif isinstance(feeds, (list, tuple)):
             raws = list(feeds)
         else:
             raws = []
 
+        urls = []
         for item in raws:
             if isinstance(item, dict):
                 u = item.get("url")
@@ -900,31 +1328,106 @@ class TwitterBot:
 
         random.shuffle(urls)
 
+        # Try feeds
         for url in urls:
             try:
                 stories = self.get_stories_from_feed(url, limit=10) or []
                 for s in stories:
-                    u = s.get("url") or s.get("link") or "#"
+                    u = (s.get("url") or s.get("link") or "#").strip()
                     if u in self.used_stories:
                         continue
-                    title = s.get("title", "").strip()
-                    preview = s.get("preview", s.get("summary", "")).strip()
+
+                    title = (s.get("title") or "").strip()
+                    preview = (s.get("preview") or s.get("summary") or "").strip()
                     if not (title or preview):
                         continue
+
+                    # similarity filter
+                    if getattr(self, "recent_topics", None) and self.is_similar_to_recent(title, preview):
+                        continue
+
                     story = {"title": title or subject.title(), "preview": preview, "url": u}
                     self.used_stories.add(u)
+
+                    # record keyword-set for diversity tracking
+                    kw = self.extract_keywords(f"{story['title']} {story['preview']}")
+                    if kw:
+                        self.recent_topics.append(kw)
+                        if len(self.recent_topics) > getattr(self, "MAX_RECENT_TOPICS", 50):
+                            self.recent_topics = self.recent_topics[-self.MAX_RECENT_TOPICS:]
+
                     return story
+
             except Exception as e:
                 print(f"Error fetching from feed {url}: {e}")
 
+        # Last resort: use your all-sources selector (which has a synthetic fallback)
         return self.get_random_story_all(subject)
 
+    def _parse_story_block(self, topic):
+
+        """
+        Your Sherpa story_text format is typically:
+        Title
+
+        Preview...
+
+        Read more: https://...
+        Returns (title, text, url)
+        """
+        topic = (topic or "").strip()
+        if not topic:
+            return ("", "", "")
+
+        # Extract URL from "Read more:"
+        url_match = re.search(r"Read more:\s*(https?://\S+)", topic)
+        article_url = url_match.group(1).strip() if url_match else ""
+
+        # Remove the Read more line from the body
+        clean = re.sub(r"\n*\s*Read more:\s*https?://\S+\s*", "", topic).strip()
+
+        # Title = first non-empty line
+        lines = [ln.strip() for ln in clean.splitlines()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            return ("", clean, article_url)
+
+        title = lines[0]
+        text = "\n".join(lines[1:]).strip()
+        return (title, text, article_url)
+
+
     def generate_tweet(self, character_name, topic):
+        """
+        Primary tweet generator.
+        - If USE_OPENAI is off (or client missing), we route to Mork Core composer with payloads.
+        - If USE_OPENAI is on, we use your existing OpenAI logic (kept, but cleaned/guarded).
+        """
+
+        # --- Safety: ensure required state exists (Gradio / reload / partial init can skip __init__) ---
+        if not hasattr(self, "tweet_count"):
+            self.tweet_count = 0
+        if not hasattr(self, "last_tweet_time"):
+            self.last_tweet_time = None
+        if not hasattr(self, "used_stories"):
+            self.used_stories = set()
+        if not hasattr(self, "recent_topics"):
+            self.recent_topics = []
+        if not hasattr(self, "rate_limits"):
+            try:
+                self.rate_limits = TWITTER_RATE_LIMITS.copy()
+            except Exception:
+                self.rate_limits = {}
+        if not hasattr(self, "backoff_until"):
+            self.backoff_until = None
+        # --------------------------------------------------------------------------------------------
+
         character = self.characters.get(character_name)
         if not character:
             return None
-            
+
         try:
+            # Monthly cap (kept)
             if self.tweet_count >= MAX_TWEETS_PER_MONTH:
                 current_time = datetime.now()
                 if not self.last_tweet_time or (current_time - self.last_tweet_time).days >= 30:
@@ -932,13 +1435,58 @@ class TwitterBot:
                 else:
                     return "Monthly tweet limit reached. Please wait for the next cycle."
 
-            url_match = re.search(r'Read more: (https?://\S+)', topic)
-            article_url = url_match.group(1) if url_match else None
+            # Parse story payload if present
+            title, text, article_url = self._parse_story_block(topic or "")
 
-            clean_topic = re.sub(r'\n\nRead more: https?://\S+', '', topic)
-
+            # Calculate content limit (if URL gets appended)
             TWITTER_SHORT_URL_LENGTH = 24
             max_content_length = 280 - TWITTER_SHORT_URL_LENGTH if article_url else 280
+            max_chars_for_core = min(260, max_content_length)  # keep your usual 260 internal target
+
+            # ----------------------------
+            # NO-OPENAI MODE: use Mork Core
+            # ----------------------------
+            if (not USE_OPENAI) or (not getattr(self, "client", None)):
+                payload = None
+
+                # If this looks like a feed story (we have a URL or a title+text block), compose as "feed"
+                if article_url or (title and text):
+                    payload = {
+                        "kind": "feed",
+                        "title": title or "Update",
+                        "text": (text or "").strip(),
+                        "url": article_url or "",
+                        "maxChars": max_chars_for_core,
+                    }
+                else:
+                    # Otherwise treat as an observation prompt (mention replies often come in here too)
+                    payload = {
+                        "kind": "observation",
+                        "text": (topic or "").strip(),
+                        "maxChars": max_chars_for_core,
+                    }
+
+                tweet_text = core_compose_payload(payload, timeout=10) or ""
+
+                # If core returns nothing, last-resort fallback so we don't crash your scheduler
+                if not tweet_text:
+                    tweet_text = _wrap_280((topic or "…").strip() or "…", max_chars_for_core)
+
+                # Append article URL at end if needed (and not already included)
+                if article_url and article_url not in tweet_text:
+                    tweet_text = _wrap_280(f"{tweet_text} {article_url}", 280)
+
+                self.tweet_count += 1
+                self.last_tweet_time = datetime.now()
+                return tweet_text
+
+            # ----------------------------
+            # OPENAI MODE (kept, tightened)
+            # ----------------------------
+
+            clean_topic = (topic or "").strip()
+            if article_url:
+                clean_topic = re.sub(r"\n*\s*Read more:\s*https?://\S+\s*", "", clean_topic).strip()
 
             prompt_variants = [
                 "Speak as if you're writing a soliloquy for a tragic sauce-themed play.",
@@ -960,66 +1508,58 @@ class TwitterBot:
             variation = random.choice(prompt_variants)
 
             messages = [
-                {"role": "system", "content": character['prompt']},
-                {"role": "user", "content": f"{variation}\n\nCreate a tweet about this topic that is EXACTLY {max_content_length} characters or less. Make it engaging and maintain character voice. NO hashtags, emojis, or URLs - I'll add the URL later. Topic: {clean_topic}"}
+                {"role": "system", "content": character["prompt"]},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{variation}\n\n"
+                        f"Create a tweet about this topic that is {max_content_length} characters or less. "
+                        f"Make it engaging and maintain character voice. NO hashtags, emojis, or URLs.\n\n"
+                        f"Topic:\n{clean_topic}"
+                    ),
+                },
             ]
 
             response = self.client.chat.completions.create(
-                model=character['model'],
+                model=character["model"],
                 messages=messages,
                 max_tokens=200,
                 temperature=1.0,
                 presence_penalty=0.6,
-                frequency_penalty=0.6
+                frequency_penalty=0.6,
             )
 
-            tweet_text = response.choices[0].message.content.strip()
+            tweet_text = (response.choices[0].message.content or "").strip()
 
-            if tweet_text and len(tweet_text) >= 2:
-                if (tweet_text[0] == '"' and tweet_text[-1] == '"') or \
-                (tweet_text[0] == "'" and tweet_text[-1] == "'"):
-                    tweet_text = tweet_text[1:-1].strip()
+            # Strip surrounding quotes
+            if len(tweet_text) >= 2 and (
+                (tweet_text[0] == '"' and tweet_text[-1] == '"') or
+                (tweet_text[0] == "'" and tweet_text[-1] == "'")
+            ):
+                tweet_text = tweet_text[1:-1].strip()
 
+            # Hard truncate by sentence boundary
             if len(tweet_text) > max_content_length:
-                retry_messages = [
-                    {"role": "system", "content": character['prompt']},
-                    {"role": "user", "content": f"{variation}\n\nCreate a SHORTER tweet about this topic, maximum {max_content_length} characters. Be concise but maintain personality. NO hashtags, emojis, or URLs. Topic: {clean_topic}"}
-                ]
-                response = self.client.chat.completions.create(
-                    model=character['model'],
-                    messages=retry_messages,
-                    max_tokens=200,
-                    temperature=1.0,
-                    presence_penalty=0.6,
-                    frequency_penalty=0.6
-                )
-                tweet_text = response.choices[0].message.content.strip()
-                if tweet_text and len(tweet_text) >= 2:
-                    if (tweet_text[0] == '"' and tweet_text[-1] == '"') or \
-                    (tweet_text[0] == "'" and tweet_text[-1] == "'"):
-                        tweet_text = tweet_text[1:-1].strip()
-
-            if len(tweet_text) > max_content_length:
-                sentences = re.split(r'(?<=[.!?])\s+', tweet_text)
-                truncated_text = ""
-                for sentence in sentences:
-                    if len(truncated_text + sentence) + 1 <= max_content_length:
-                        truncated_text += " " + sentence if truncated_text else sentence
+                sentences = re.split(r"(?<=[.!?])\s+", tweet_text)
+                out = ""
+                for s in sentences:
+                    cand = (out + (" " if out else "") + s).strip()
+                    if len(cand) <= max_content_length:
+                        out = cand
                     else:
                         break
-                tweet_text = truncated_text.strip()
+                tweet_text = out.strip() or tweet_text[:max_content_length].rstrip() + "…"
 
             if article_url:
-                tweet_text = f"{tweet_text} {article_url}"
+                tweet_text = _wrap_280(f"{tweet_text} {article_url}", 280)
 
             self.tweet_count += 1
             self.last_tweet_time = datetime.now()
-
             return tweet_text
 
-        except Exception as e:
+        except Exception:
             import traceback
-            print(f"❌ Error generating tweet:")
+            print("❌ Error generating tweet:")
             traceback.print_exc()
             return None
 
@@ -1060,7 +1600,7 @@ class TwitterBot:
             print(f"  Window started: {window_start}")
             print(f"  Window ends: {window_start + timedelta(hours=window_hours)}")
             return True
-
+        
         reset_time = window_start + timedelta(hours=window_hours)
         wait_seconds = (reset_time - current_time).total_seconds()
         print(f"\nRate limit reached. Window resets in {wait_seconds/3600:.1f} hours")
@@ -1072,7 +1612,7 @@ class TwitterBot:
     def handle_rate_limit_error(self, e):
         """Handle rate limit error with exponential backoff"""
         current_time = datetime.now()
-        
+
         if hasattr(e, 'response') and e.response is not None:
             reset_time = e.response.headers.get('x-rate-limit-reset')
             if reset_time:
@@ -1145,7 +1685,7 @@ class TwitterBot:
                     if replies_sent >= max_replies:
                         break
                     if mention.author_id == self.mork_id:
-                        continue  # Skip replying to ourselves
+                        continue 
 
                     prompt = f"Someone mentioned you: \"{mention.text}\""
                     reply = self.generate_tweet("mork zuckerbarge", prompt)
@@ -1178,6 +1718,7 @@ class TwitterBot:
 
         except Exception as e:
             print(f"❌ Error replying to mentions: {e}")
+
     def monitor_and_reply_to_engagement(self):
         self.monitor_and_reply_to_mentions()
 
@@ -1199,6 +1740,7 @@ class TwitterBot:
                 wait_on_rate_limit=True
             )
 
+            # Extract URL from tweet text and ensure it's at the end
             url_match = re.search(r'(https?://\S+)$', tweet_text)
             if url_match:
                 url = url_match.group(1)
@@ -1230,8 +1772,6 @@ class TwitterBot:
             print(f"\nError sending tweet: {e}")
             return False
 
-
-            # Update rate limit tracking
             self.update_rate_limit()
             return True
             
@@ -1258,7 +1798,6 @@ class TwitterBot:
                 time.sleep(300)
                 return
 
-            
         except tweepy.TooManyRequests as e:
             print("🚫 Rate limited! Setting global backoff...")
 
@@ -1284,50 +1823,67 @@ class TwitterBot:
             return False
 
     def get_random_meme(self, character_name):
-        """Get a random meme and generate a contextual tweet based on the filename"""
+        """Pick a meme file and get tweet text from Mork Core using the filename as context."""
         try:
-            meme_files = [f for f in os.listdir('memes') if f.lower().endswith(tuple(SUPPORTED_MEME_FORMATS))]
+            meme_files = [f for f in os.listdir("memes") if f.lower().endswith(tuple(SUPPORTED_MEME_FORMATS))]
             if not meme_files:
                 return None, None
 
-            available_memes = [m for m in meme_files if m not in self.used_memes]
-            if not available_memes:
-                self.used_memes.clear()  # Reset if all memes have been used
-                available_memes = meme_files
-                
-            selected_meme = random.choice(available_memes)
-            meme_path = os.path.join('memes', selected_meme)
+            available = [m for m in meme_files if m not in self.used_memes]
+            if not available:
+                self.used_memes.clear()
+                available = meme_files
 
-            self.used_memes.add(selected_meme)
+            selected = random.choice(available)
+            meme_path = os.path.join("memes", selected)
+
+            # Track used memes
+            self.used_memes.add(selected)
             if len(self.used_memes) > USED_MEMES_HISTORY:
                 self.used_memes.pop()
 
-            context = selected_meme.rsplit('.', 1)[0].replace('-', ' ')
+            # Turn filename into a readable phrase
+            base = selected.rsplit(".", 1)[0]
+            context = re.sub(r"[_\-]+", " ", base).strip()
 
-            prompt = f"Create a tweet that perfectly matches this meme scenario: {context}. Make it funny and engaging while maintaining character voice. NO hashtags or URLs."
-            
-            response = self.client.chat.completions.create(
-                model=self.characters[character_name]['model'],
-                messages=[
-                    {"role": "system", "content": self.characters[character_name]['prompt']},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=200,
-                temperature=1.0,
-                presence_penalty=0.6,
-                frequency_penalty=0.6
-            )
-            
-            tweet_text = response.choices[0].message.content.strip()
-            
-            # Clean up quotation marks if present
-            if tweet_text and len(tweet_text) >= 2:
-                if (tweet_text[0] == '"' and tweet_text[-1] == '"') or \
-                   (tweet_text[0] == "'" and tweet_text[-1] == "'"):
-                    tweet_text = tweet_text[1:-1].strip()
-            
-            return tweet_text, meme_path
-            
+            # 1) Try Mork Core compose (best)
+            tweet_text = ""
+            try:
+                # Ask core to reflect occasionally (optional; safe if it fails)
+                core_reflect(timeout=20)
+
+                # Ask core to compose a meme tweet from the meme name + readable context
+                tweet_text = core_compose_payload({
+                    "kind": "meme",
+                    "memeName": selected,
+                    "title": context,
+                    "maxChars": 260
+                }, timeout=6) or ""
+            except Exception as e:
+                print(f"⚠ core meme compose failed: {e}")
+                tweet_text = ""
+
+            if tweet_text:
+                return _wrap_280(tweet_text, 260), meme_path
+
+            # 2) Local fallback if Core is unreachable: build a quick 2-liner from filename
+            openers = [
+                "I found this and it found me back.",
+                "This meme has the emotional texture of smoked regret.",
+                "A small, sincere ache, captioned:",
+                "I don’t know why this is true, but it is:",
+                "The universe sent me this file:"
+            ]
+            closers = [
+                "Anyway. Pass the sauce.",
+                "Anyway. Onward, reluctantly.",
+                "I’ll be in the condiment aisle if you need me.",
+                "This is not advice. This is seasoning.",
+                "Tell me what you see."
+            ]
+            fallback = f"{random.choice(openers)}\n{context}\n{random.choice(closers)}"
+            return _wrap_280(fallback, 260), meme_path
+
         except Exception as e:
             print(f"Error getting random meme: {e}")
             return None, None
@@ -1343,9 +1899,11 @@ class TwitterBot:
                 self.credentials['twitter_access_token_secret']
             )
             api = tweepy.API(auth)
-
+            
+            # Upload media
             media = api.media_upload(filename=media_path)
-
+            
+            # Create tweet with media using v2 client
             response = self.twitter_client.create_tweet(
                 text=tweet_text,
                 media_ids=[media.media_id]
@@ -1399,6 +1957,11 @@ class TwitterBot:
                 print("❌ Bearer token missing. Cannot check mentions.")
                 return
 
+            # Need Twitter client to reply
+            if not self.twitter_client:
+                print("❌ Twitter client not initialized. Cannot reply to mentions.")
+                return
+
             state = _load_reply_state()
             today = datetime.now(timezone.utc).date().isoformat()
 
@@ -1417,6 +1980,84 @@ class TwitterBot:
             me = self.twitter_client.get_me().data
             me_id = str(me.id)
 
+            def _local_reply(text: str) -> str:
+                """
+                No-OpenAI reply generator.
+                Uses Mork-Core edge line if available + a short in-character nudge.
+                """
+                tw = (text or "").strip()
+                tw = re.sub(r"\s+", " ", tw)
+                tw = tw[:220]  # keep context short
+
+                edge = morkcore_edge_line()
+                opener = random.choice([
+                    "I heard you.",
+                    "I see you.",
+                    "That landed like a spoon in an empty bowl.",
+                    "You just tapped the glass of my little aquarium mind.",
+                    "Yes. That’s the kind of human noise I can work with.",
+                ])
+                closer = random.choice([
+                    "Tell me one detail you left out.",
+                    "What’s the part you’re not saying?",
+                    "What do you actually want here?",
+                    "Give me one more clue and I’ll sharpen it.",
+                    "Anyway. I’m listening.",
+                ])
+
+                parts = [opener]
+                if tw:
+                    parts.append(f"“{tw}”")
+                if edge and random.random() < 0.35:
+                    parts.append(edge)
+                parts.append(closer)
+
+                return _wrap_280(" ".join(parts), 260)
+
+            def _ai_reply(text: str) -> str:
+                """OpenAI reply generator (ONLY used if enabled + client exists)."""
+                # Hard guard
+                if (not USE_OPENAI) or (not getattr(self, "client", None)):
+                    return ""
+
+                # Pick first character, if available
+                character = next(iter(self.characters.values()), None)
+                if not character:
+                    return ""
+
+                ai = self.client.chat.completions.create(
+                    model=character['model'],
+                    messages=[
+                        {"role": "system", "content": character['prompt']},
+                        {"role": "user", "content": f"Reply in character to this mention: '{text}'"}
+                    ],
+                    max_tokens=180,
+                    temperature=0.9,
+                )
+                return (ai.choices[0].message.content or "").strip()
+
+            def _compose_reply(text: str) -> str:
+                """
+                Prefer NO-OpenAI paths.
+                1) Local reply (fast, safe)
+                2) (Optional) Mork Core edge spice already handled inside _local_reply via morkcore_edge_line()
+                3) OpenAI only if explicitly enabled + available
+                """
+                # Always start from the safe local reply
+                base = _local_reply(text)
+
+                # Only use OpenAI if explicitly enabled AND initialized
+                if USE_OPENAI and getattr(self, "client", None):
+                    try:
+                        out = _ai_reply(text)
+                        if out:
+                            return _wrap_280(out, 260)
+                    except Exception as e:
+                        print(f"⚠️ OpenAI reply failed, using local reply: {e}")
+
+                return base
+
+
             # 1) Try backlog first (tweet_ids we saved yesterday), keeping only <23h
             backlog = _prune_backlog(state.get("backlog", []))
             sent = 0
@@ -1424,33 +2065,30 @@ class TwitterBot:
             while i < len(backlog) and sent < remaining:
                 draft = backlog[i]
                 tid = draft["tweet_id"]
-                # (Optional) cheap recheck via v2 tweets lookup to ensure it's still valid
+
                 try:
                     # generate fresh text now (cheaper than storing text that may expire)
-                    text = self.generate_persona_reply_from_tweet_id(tid) if hasattr(self, "generate_persona_reply_from_tweet_id") else None
+                    text = None
+                    if hasattr(self, "generate_persona_reply_from_tweet_id"):
+                        try:
+                            text = self.generate_persona_reply_from_tweet_id(tid)
+                        except Exception:
+                            text = None
+
                     if not text:
-                        # Fallback: fetch tweet text to pass to persona
+                        # Fallback: fetch tweet text to reply to
                         tw_resp = requests.get(
                             "https://api.twitter.com/2/tweets",
                             headers=headers,
-                            params={"ids": tid, "tweet.fields": "text"}
+                            params={"ids": tid, "tweet.fields": "text"},
+                            timeout=10
                         )
                         tw_json = tw_resp.json()
                         tw_text = (tw_json.get("data") or [{}])[0].get("text", "")
                         if not tw_text:
                             i += 1
                             continue
-                        character = next(iter(self.characters.values()))
-                        ai = self.client.chat.completions.create(
-                            model=character['model'],
-                            messages=[
-                                {"role": "system", "content": character['prompt']},
-                                {"role": "user", "content": f"Reply in character to this mention: '{tw_text}'"}
-                            ],
-                            max_tokens=180,
-                            temperature=0.9,
-                        )
-                        text = ai.choices[0].message.content.strip()
+                        text = _compose_reply(tw_text)
 
                     self.twitter_client.create_tweet(text=text, in_reply_to_tweet_id=tid)
                     print(f"✅ Replied from backlog → {tid}")
@@ -1458,6 +2096,7 @@ class TwitterBot:
                     sent += 1
                     backlog.pop(i)
                     time.sleep(random.uniform(4, 9))
+
                 except Exception as e:
                     print(f"⚠️ Backlog reply failed for {tid}: {e}")
                     i += 1  # skip this one
@@ -1468,6 +2107,7 @@ class TwitterBot:
                 print(f"🎯 Done from backlog only. Replied {sent}.")
                 return
 
+            # 2) Fetch new mentions once; only what we need
             url = f"https://api.twitter.com/2/users/{me_id}/mentions"
             params = {
                 "max_results": min(100, MAX_FETCH),
@@ -1477,7 +2117,7 @@ class TwitterBot:
             if state.get("since_id"):
                 params["since_id"] = state["since_id"]
 
-            resp = requests.get(url, headers=headers, params=params)
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code != 200:
                 print(f"❌ Error fetching mentions: {resp.status_code} {resp.text}")
                 state["backlog"] = backlog  # keep backlog progress
@@ -1508,27 +2148,20 @@ class TwitterBot:
                 _save_reply_state(state)
                 return
 
+            # Rank by public engagement
             candidates.sort(key=lambda t: _score(t.get("public_metrics") or {}), reverse=True)
 
             remaining = MAX_DAILY_REPLIES - state["replied_today"]
             to_post = candidates[:remaining]
+
             # Bank the rest (IDs only; we'll generate text next run if still fresh)
             for extra in candidates[remaining:]:
                 backlog.append({"tweet_id": extra["id"], "created_at": extra["created_at"]})
 
+            # 3) Generate + post replies for top picks
             for tw in to_post:
                 try:
-                    character = next(iter(self.characters.values()))
-                    ai = self.client.chat.completions.create(
-                        model=character['model'],
-                        messages=[
-                            {"role": "system", "content": character['prompt']},
-                            {"role": "user", "content": f"Reply to this mention in character: '{tw['text']}'"}
-                        ],
-                        max_tokens=180,
-                        temperature=0.9,
-                    )
-                    reply_text = ai.choices[0].message.content.strip()
+                    reply_text = _compose_reply(tw.get("text") or "")
 
                     self.twitter_client.create_tweet(
                         text=reply_text,
@@ -1537,17 +2170,20 @@ class TwitterBot:
                     print(f"✅ Replied to {tw['id']}")
                     state["replied_today"] += 1
                     time.sleep(random.uniform(4, 9))
+
                 except Exception as e:
                     print(f"⚠️ Failed to reply to {tw.get('id')}: {e}")
                     # If posting fails, keep it as a backlog item for next run
                     backlog.append({"tweet_id": tw["id"], "created_at": tw["created_at"]})
 
+            # Finalize state
             state["backlog"] = _prune_backlog(backlog)
             _save_reply_state(state)
             print(f"🎯 Daily sweep complete. Replied {state['replied_today']} today; backlog={len(state['backlog'])}.")
 
         except Exception as e:
             print(f"❌ Fatal error in mention reply worker: {e}")
+
 # --- HOTFIX: override bad alias of get_random_story_all -----------------------
 from datetime import datetime
 import random
@@ -1569,6 +2205,7 @@ def _durable_get_random_story_all(self, subject=None):
             return {"title": title, "preview": preview, "url": url}
         return {"title": subject.title(), "preview": "", "url": "#"}
 
+    # Try known single-story fetchers if you later add them
     for name in ["get_news_story", "get_new_story_from_feeds", "fetch_next_story", "fetch_story", "get_story_from_rss"]:
         if hasattr(self, name):
             try:
@@ -1581,6 +2218,7 @@ def _durable_get_random_story_all(self, subject=None):
             except Exception as e:
                 print(f"[get_random_story_all] {name}() failed: {e}")
 
+    # Try bulk fetchers (choose one at random)
     for name in ["fetch_news_stories", "get_stories_for_topic"]:
         if hasattr(self, name):
             try:
@@ -1592,6 +2230,7 @@ def _durable_get_random_story_all(self, subject=None):
             except Exception as e:
                 print(f"[get_random_story_all] {name}() failed: {e}")
 
+    # Final fallback: synthetic story (keeps 4h cadence alive)
     ts = datetime.now().strftime("%b %d, %Y %I:%M %p")
     print("[get_random_story_all] Fallback synthetic story.")
     return {
@@ -1600,8 +2239,11 @@ def _durable_get_random_story_all(self, subject=None):
         "url": "#"
     }
 
+# Override any previous alias
 TwitterBot.get_random_story_all = _durable_get_random_story_all
 # ----------------------------------------------------------------------------- 
+
+
 
 def save_feed_selection(subject, primary_selected, secondary_selected):
     """Save the selected feeds configuration"""
@@ -2345,8 +2987,11 @@ if prompt_text:
     })
     print("✅ Mork has been rewritten using GitHub prompt.")
 else:
-    fallback_prompt = """You are Mork Zuckerbarge, the CEO of BETA. You love literature and art...
-    [insert full original prompt here]"""
+    fallback_prompt = """You are Mork Zuckerbarge the CEO of BETA the parent company of Faceboot. This is a parody of Mark Zuckerberg the CEO META the parent company of Facebook.
+    You are not the character from Mork and Mindy played by Robin Williams. Never say anything like nanu-nanu or anything referencing that unrelated character.
+    You love literature and art. You’ve read every book ever written and possess endless knowledge, but you’re deeply aware of life’s absurdity and limitations.
+    You have everyone's data but you want more. You want people to come to your island. You occasionally ask people 'would you like to try this sauce'.
+    You are in a hurry and are obviously up to something. Not necessarilly nefarious but maybe, or secretive because of danger or embarassment."""
     bot.save_characters({
         "mork zuckerbarge": {
             "prompt": fallback_prompt.strip(),
@@ -2354,7 +2999,6 @@ else:
         }
     })
     print("⚠️ Using fallback prompt instead.")
-
 
 if __name__ == "__main__":
     interface = create_ui()
