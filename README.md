@@ -1,23 +1,10 @@
-# AI Twitter Bot for Crypto
 
-This bot automatically posts on X using AI personalities. It's like having your own influencer that never sleeps.
 
 ## What You Need
 - A computer (Windows, Mac, or Linux)
 - Internet connection
-- Two accounts:
-  1. OpenAI account (for the AI brain)
-  2. Twitter/X developer account (for posting)
 
 ## Step 1: Get Your Keys
-You need 3 sets of keys. Here's how to get them:
-
-### OpenAI Key (for the AI brain)
-1. Go to https://platform.openai.com/api-keys
-2. Sign up if you haven't
-3. Add a payment method (they charge a tiny bit per tweet)
-4. Click "Create new secret key"
-5. Copy it somewhere safe
 
 ### Twitter Keys (for posting)
 1. Go to https://developer.twitter.com/portal/dashboard
@@ -30,7 +17,7 @@ You need 3 sets of keys. Here's how to get them:
 6. In your app settings, make sure to enable "Read and Write"
 
 ### Telegram Key (for sharing tweets to Telegram)
-1. 
+
 ## Step 2: Install & Run
 
 ### On Windows:
@@ -84,9 +71,9 @@ You need 3 sets of keys. Here's how to get them:
    ```
 
 ## Step 3: Set Up Your Bot
-1. When the app opens, paste in your API keys
-2. Create an AI character (like "Leveraged Crypto Trader" or "Edgelord")
-3. Click "Enable Scheduler" to let it run automatically
+1. When the app opens, paste in your API keys. Save credentials.
+2. Create your character. (Or do it in the python file.)
+3. Click "Enable Scheduler" to launch autopilot.
 
 ## Important Notes
 - The bot posts every 1.5 hours
@@ -99,8 +86,7 @@ You need 3 sets of keys. Here's how to get them:
 ## Help! Something's Wrong!
 
 ### Windows Users:
-- If you see a blue SmartScreen popup, click "More Info" then "Run Anyway"
-- If it says "Python not found", close and reopen the program
+
 - Make sure you're running as Administrator if installation fails
 
 ### Mac Users:
