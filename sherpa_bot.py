@@ -25,6 +25,12 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 load_dotenv()
 
+MAIN_TWEET_BASE_MIN = 240
+MAIN_TWEET_JITTER_MIN = 45
+OBS_BASE_MIN = 180
+OBS_JITTER_MIN = 30
+MIN_GAP_MIN = 30
+
 REPLY_STATE_FILE = "reply_state.json"
 MAX_DAILY_REPLIES = 3
 MAX_FETCH = 50
@@ -41,7 +47,42 @@ def _get_core_url():
         print(f"⚠ MORK_CORE_URL is a placeholder: '{u}'. Please set a real URL.")
         return "http://localhost:8787"
     return u
+def _clamp(n, lo, hi):
+    return max(lo, min(hi, n))
 
+def compute_next_run(
+    base_minutes: int,
+    jitter_minutes: int,
+    active_start_hour: int = 8,
+    active_end_hour: int = 23,
+    min_gap_minutes: int = 30,
+):
+    """
+    Returns a datetime for the next run:
+    - base cadence (base_minutes)
+    - +/- jitter (jitter_minutes)
+    - only within active hours window
+    - minimum gap enforced
+    """
+    now = datetime.now()
+
+    jitter = random.randint(-jitter_minutes, jitter_minutes)
+    delta = base_minutes + jitter
+    delta = _clamp(delta, min_gap_minutes, base_minutes + jitter_minutes)
+
+    nxt = now + timedelta(minutes=delta)
+
+    # If outside active hours, push into next day's window with some randomness
+    if nxt.hour < active_start_hour:
+        nxt = nxt.replace(hour=active_start_hour, minute=random.randint(0, 20), second=0, microsecond=0)
+    elif nxt.hour >= active_end_hour:
+        # next day morning
+        nxt = (nxt + timedelta(days=1)).replace(hour=active_start_hour, minute=random.randint(0, 35), second=0, microsecond=0)
+
+    return nxt
+
+def seconds_until(dt: datetime) -> float:
+    return max(0.0, (dt - datetime.now()).total_seconds())
 MORK_CORE_URL = _get_core_url()
 
 def _core_base_url() -> str:
@@ -88,40 +129,119 @@ def core_compose_payload(payload: dict, timeout=10) -> str:
       - NEW: POST /x/compose with JSON payload (recommended)
       - OLD: GET /x/compose?mode=observation|edge|reflection (fallback)
 
-    payload examples:
-      {"kind":"feed","title":...,"text":...,"url":...,"maxChars":260}
-      {"kind":"meme","memeName":"when-i-see-slippage.png","maxChars":260}
-      {"kind":"arb","maxChars":260}
-      {"kind":"observation","maxChars":260}
-      {"kind":"reflection","maxChars":260}
+    Adds "memory layers" + voice variance hints:
+      - voice: small random style nudges (safe)
+      - seed: stable-ish randomness input for variety
+      - constraints: shared tweet rules / bans (if Core chooses to honor them)
     """
+    import random
+    import time
+
     base = _core_base_url()
-    payload = payload or {}
+    payload = dict(payload or {})
     payload.setdefault("maxChars", 260)
+
+    # -----------------------------
+    # Memory layers / voice variance
+    # -----------------------------
+    def _voice_palette():
+        # short nudges that change *how* it speaks, not *what* it says
+        return random.choice([
+            "Dry wit, understated.",
+            "Melancholy but composed.",
+            "Terse, executive tone with subtle unease.",
+            "Literary, but not purple.",
+            "Clinical observation, then one human aside.",
+            "Quietly amused, slightly ominous.",
+            "Reflective, grounded, no theatrics.",
+        ])
+
+    # A seed that changes over time but isn't obviously periodic.
+    # Core can use this to randomize sampling or template selection.
+    seed = payload.get("seed")
+    if seed is None:
+        seed = int(time.time()) ^ random.randint(0, 2**16 - 1)
+
+    # Shared constraints (Core may already have its own; these are additive hints)
+    # Keep these consistent with your server.ts instruction bans.
+    constraints = payload.get("constraints") or {}
+    constraints.setdefault("banPhrases", [
+        "nanu nanu", "na-nu", "shazbot", "gleeb", "gleek", "ork", "mork and mindy"
+    ])
+    constraints.setdefault("noHashtags", True)
+    constraints.setdefault("noEmojis", True)
+    constraints.setdefault("noUrls", True)  # Core can re-allow for feed if you want
+    constraints.setdefault("noQuoteUserText", True)
+
+    # Add voice + seed + optional jitter hints
+    payload.setdefault("voice", _voice_palette())
+    payload.setdefault("seed", seed)
+    payload.setdefault("constraints", constraints)
+
+    # Optional: give Core permission to vary its phrasing/structure
+    payload.setdefault("variance", {
+        "style": random.uniform(0.35, 0.85),   # tone/structure variance
+        "novelty": random.uniform(0.25, 0.75), # how different vs recent memory
+    })
+
+    # If this is a feed tweet and you WANT url appended by Sherpa later,
+    # keep Core "noUrls" true and let Sherpa append (your current behavior).
+    # If you ever want Core to append URLs, set constraints.noUrls=False per kind=feed.
 
     # 1) Try POST (new style)
     try:
         r = requests.post(f"{base}/x/compose", json=payload, timeout=timeout)
+
         if r.ok:
-            j = r.json() if "application/json" in (r.headers.get("content-type") or "") else {}
-            out = (j.get("tweet") or "").strip()
-            return out
+            # Expect JSON { ok:true, tweet:"..." } but stay defensive
+            if "application/json" in (r.headers.get("content-type") or ""):
+                j = r.json() or {}
+                out = (j.get("tweet") or j.get("text") or "").strip()
+            else:
+                out = (r.text or "").strip()
+
+            # final cleanups (safe)
+            out = out.strip().strip("\u200b")
+
+            # unwrap quotes
+            if (out.startswith('"') and out.endswith('"')) or (out.startswith("'") and out.endswith("'")):
+                out = out[1:-1].strip()
+
+            return out[: int(payload.get("maxChars", 260))]
+
         print(f"⚠ core_compose bad status {r.status_code}: {r.text[:200]}")
+
     except Exception as e:
         print(f"⚠ core_compose POST failed: {e}")
 
     # 2) Fallback to GET (old style)
     try:
         mode = (payload.get("mode") or payload.get("kind") or "observation")
-        r = requests.get(f"{base}/x/compose", params={"mode": mode}, timeout=min(5, timeout))
+        r = requests.get(
+            f"{base}/x/compose",
+            params={"mode": mode},
+            timeout=min(5, timeout),
+        )
         if not r.ok:
             print(f"⚠ core_compose GET bad status {r.status_code}: {r.text[:200]}")
             return ""
-        j = r.json() if "application/json" in (r.headers.get("content-type") or "") else {}
-        return (j.get("tweet") or "").strip()
+
+        if "application/json" in (r.headers.get("content-type") or ""):
+            j = r.json() or {}
+            out = (j.get("tweet") or j.get("text") or "").strip()
+        else:
+            out = (r.text or "").strip()
+
+        # unwrap quotes
+        if (out.startswith('"') and out.endswith('"')) or (out.startswith("'") and out.endswith("'")):
+            out = out[1:-1].strip()
+
+        return out[: int(payload.get("maxChars", 260))]
+
     except Exception as e:
         print(f"⚠ core_compose GET failed: {e}")
         return ""
+
 def _wrap_280(s: str, max_len: int = 260) -> str:
     # Preserve newlines for tweet formatting, but collapse repeated spaces
     s = (s or "").strip()
@@ -677,6 +797,7 @@ class CryptoArticle:
 
 
 class TwitterBot:
+
     def __init__(self):
         print("\n=== Initializing TwitterBot ===")
         self.encryption_manager = EncryptionManager()
@@ -725,7 +846,7 @@ class TwitterBot:
 
         print("\n=== Loading Initial Data ===")
         self.credentials = self.load_credentials()
-        print(f"Loaded credentials: {json.dumps(self.credentials, indent=2)}")
+        print(f"[init] Credentials keys: {list(self.credentials.keys())}")
 
         self.characters = self.load_characters()
         print(f"Loaded characters: {json.dumps(self.characters, indent=2)}")
@@ -766,7 +887,28 @@ class TwitterBot:
             print("Twitter client initialized.")
         else:
             print("Twitter client NOT initialized (missing X credentials).")
+    def load_credentials(self):
+        """
+        Loads and decrypts credentials from disk.
+        Uses EncryptionManager + CREDENTIALS_FILE.
+        """
+        if not hasattr(self, "encryption_manager") or self.encryption_manager is None:
+            self.encryption_manager = EncryptionManager()
 
+        if not os.path.exists(CREDENTIALS_FILE):
+            print("Credentials file not found, returning empty creds.")
+            return {}
+
+        try:
+            with open(CREDENTIALS_FILE, "rb") as f:
+                blob = f.read()
+                data = self.encryption_manager.decrypt(blob) or {}
+            if not isinstance(data, dict):
+                return {}
+            return data
+        except Exception as e:
+            print(f"Error loading credentials: {e}")
+            return {}
     def _normalize_subject(self, subject):
         """
         Map placeholders like 'Surprise_All'/'random' to a real subject from feed_config or RSS_FEEDS.
@@ -798,115 +940,210 @@ class TwitterBot:
 
         return s_raw or "news"
 
-    def scheduler_worker(self):
-        print("\n🛠️ Starting scheduler worker...")
+def scheduler_worker(self):
+    print("\n🛠️ Starting scheduler worker (jittered)...")
 
-        # Persist character/subject for auto-refill later
-        self.scheduler_character = getattr(self, "scheduler_character", None)
-        self.scheduler_subject = getattr(self, "scheduler_subject", "crypto")
+    # -------------------------
+    # Config knobs (override-friendly)
+    # -------------------------
+    ACTIVE_START_HOUR = int(getattr(self, "ACTIVE_START_HOUR", 8))
+    ACTIVE_END_HOUR   = int(getattr(self, "ACTIVE_END_HOUR", 23))   # end is exclusive
+    MIN_GAP_MIN       = int(getattr(self, "MIN_GAP_MIN", 35))       # never schedule sooner than this
 
-        # State for cadence + daily reply window
-        self.reply_bank = getattr(self, "reply_bank", [])
-        self.last_daily_reply_date = getattr(self, "last_daily_reply_date", None)
-        self.last_observation_time = getattr(self, "last_observation_time", None)
+    MAIN_BASE_MIN     = int(getattr(self, "MAIN_BASE_MIN", 240))    # ~4h
+    MAIN_JITTER_MIN   = int(getattr(self, "MAIN_JITTER_MIN", 70))   # +/- 70m
 
-        # If never tweeted successfully, don't wait 4 hours on first run
-        if not getattr(self, "last_successful_tweet", None):
-            print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
-            self.last_successful_tweet = datetime.now()
-        # Prevent an immediate observation tweet right after startup / meme post
-        if self.last_observation_time is None:
-            self.last_observation_time = datetime.now()
+    OBS_BASE_MIN      = int(getattr(self, "OBS_BASE_MIN", 180))     # ~3h
+    OBS_JITTER_MIN    = int(getattr(self, "OBS_JITTER_MIN", 60))    # +/- 60m
 
-        OBS_INTERVAL = timedelta(hours=3)
-        MAIN_TWEET_INTERVAL_SEC = 4 * 3600
+    MENTION_BASE_MIN  = int(getattr(self, "MENTION_BASE_MIN", 12))  # ~12m
+    MENTION_JITTER_MIN= int(getattr(self, "MENTION_JITTER_MIN", 4)) # +/- 4m
 
-        while self.scheduler_running:
-            try:
-                # Respect any backoff
-                if self.backoff_until and datetime.now() < self.backoff_until:
-                    wait_seconds = (self.backoff_until - datetime.now()).total_seconds()
-                    print(
-                        f"⏳ Backoff active until {self.backoff_until}. "
-                        f"Sleeping {wait_seconds/60:.1f} minutes..."
-                    )
-                    time.sleep(min(60, max(1, wait_seconds)))
-                    continue
+    DAILY_MENTION_CAP = int(getattr(self, "DAILY_MENTION_CAP", 2))
 
-                now = datetime.now()
+    # Persist character/subject for auto-refill later
+    self.scheduler_character = getattr(self, "scheduler_character", None)
+    self.scheduler_subject   = getattr(self, "scheduler_subject", "crypto")
 
-                # === (1) Daily replies at ~10:00 AM ===
-                ten_am_today = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    # State
+    self.reply_bank = getattr(self, "reply_bank", [])
+    self.last_daily_reply_date = getattr(self, "last_daily_reply_date", None)
+    self.daily_replies_sent = getattr(self, "daily_replies_sent", 0)
+    self.last_observation_time = getattr(self, "last_observation_time", None)
 
-                if self.last_daily_reply_date != now.date() and now >= ten_am_today:
-                    print("\n📬 10:00 AM reached — checking mentions and replying to up to 2…")
-                    handled = 0
+    # If never tweeted successfully, don't wait forever on first run
+    if not getattr(self, "last_successful_tweet", None):
+        print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
+        self.last_successful_tweet = datetime.now()
 
-                    pending = []
-                    if self.reply_bank:
-                        print(f"↪ Using {len(self.reply_bank)} banked mentions first.")
-                        pending.extend(self.reply_bank)
-                        self.reply_bank = []
+    if self.last_observation_time is None:
+        self.last_observation_time = datetime.now()
 
-                    if not pending:
-                        try:
-                            if hasattr(self, "collect_unreplied_mentions"):
-                                pending = self.collect_unreplied_mentions() or []
-                            elif hasattr(self, "fetch_recent_mentions"):
-                                pending = self.fetch_recent_mentions() or []
-                            elif hasattr(self, "monitor_and_reply_to_mentions"):
-                                print("⚠ Using monitor_and_reply_to_mentions fallback.")
-                                self.monitor_and_reply_to_mentions()
-                                pending = []
-                            else:
-                                print("⚠ No mention-collection method found.")
-                                pending = []
-                        except Exception as e:
-                            print(f"❌ Error fetching mentions: {e}")
-                            pending = []
+    # -------------------------
+    # Helpers (LOCAL => no NameError)
+    # -------------------------
+    def within_active_hours(dt: datetime) -> bool:
+        return (dt.hour >= ACTIVE_START_HOUR) and (dt.hour < ACTIVE_END_HOUR)
 
-                    for m in pending:
-                        if handled >= 2:
-                            self.reply_bank.append(m)
-                            continue
-                        try:
-                            if hasattr(self, "reply_to_mention"):
-                                self.reply_to_mention(m)
-                                handled += 1
-                            elif hasattr(self, "reply_to_engagement"):
-                                self.reply_to_engagement(m)
-                                handled += 1
-                            else:
-                                self.reply_bank.append(m)
-                        except Exception as e:
-                            print(f"❌ Failed replying to a mention: {e}")
-                            self.reply_bank.append(m)
+    def push_into_active_window(dt: datetime) -> datetime:
+        """
+        If dt falls outside the active window, push it into the next valid window
+        with a small random offset so it doesn't always hit exactly :00.
+        """
+        if within_active_hours(dt):
+            return dt
 
-                    print(
-                        f"✅ Replied to {handled} mention(s). "
-                        f"Banked {len(self.reply_bank)} leftover(s)."
-                    )
-                    self.last_daily_reply_date = now.date()
+        # too early -> today at ACTIVE_START_HOUR
+        if dt.hour < ACTIVE_START_HOUR:
+            return dt.replace(
+                hour=ACTIVE_START_HOUR,
+                minute=random.randint(0, 35),
+                second=random.randint(0, 20),
+                microsecond=0,
+            )
 
-                # === (2) Periodic Mork Core observation (Option 3.B) ===
-                if self.last_observation_time is None or (now - self.last_observation_time) >= OBS_INTERVAL:
+        # too late -> tomorrow morning
+        nxt = dt + timedelta(days=1)
+        return nxt.replace(
+            hour=ACTIVE_START_HOUR,
+            minute=random.randint(0, 45),
+            second=random.randint(0, 25),
+            microsecond=0,
+        )
+
+    def schedule_next(base_min: int, jitter_min: int, min_gap_min: int = MIN_GAP_MIN) -> datetime:
+        """
+        Schedule next runtime with jitter, clamped so it never becomes negative/silly,
+        then pushed into active window.
+        """
+        now = datetime.now()
+        jitter = random.randint(-jitter_min, jitter_min)
+        raw = base_min + jitter
+
+        # clamp: at least min_gap_min; at most base_min + jitter_min
+        mins = max(min_gap_min, min(raw, base_min + jitter_min))
+        dt = now + timedelta(minutes=mins)
+        return push_into_active_window(dt)
+
+    # -------------------------
+    # Initial schedules (avoid instant posting on boot)
+    # -------------------------
+    next_main_at     = schedule_next(base_min=45, jitter_min=20, min_gap_min=MIN_GAP_MIN)
+    next_obs_at      = schedule_next(base_min=60, jitter_min=25, min_gap_min=MIN_GAP_MIN)
+    next_mentions_at = schedule_next(base_min=MENTION_BASE_MIN, jitter_min=MENTION_JITTER_MIN, min_gap_min=3)
+
+    print(f"⏱ Next MAIN tweet    : {next_main_at}")
+    print(f"⏱ Next OBS tweet     : {next_obs_at}")
+    print(f"⏱ Next mention sweep : {next_mentions_at}")
+    print(f"🕒 Active hours      : {ACTIVE_START_HOUR:02d}:00–{ACTIVE_END_HOUR:02d}:00")
+    print(f"🧾 Daily mention cap  : {DAILY_MENTION_CAP}")
+
+    # -------------------------
+    # Loop
+    # -------------------------
+    while self.scheduler_running:
+        try:
+            now = datetime.now()
+
+            # Reset daily counter when day changes
+            if self.last_daily_reply_date != now.date():
+                self.last_daily_reply_date = now.date()
+                self.daily_replies_sent = 0
+
+            # Respect backoff
+            if getattr(self, "backoff_until", None) and now < self.backoff_until:
+                wait_seconds = (self.backoff_until - now).total_seconds()
+                print(f"⏳ Backoff active until {self.backoff_until}. Sleeping {wait_seconds/60:.1f} minutes...")
+                time.sleep(min(60, max(1, wait_seconds)))
+                continue
+
+            # -------------------------
+            # (A) Mentions sweep (reply only to mentions; bank overflow)
+            # -------------------------
+            if now >= next_mentions_at:
+                next_mentions_at = schedule_next(MENTION_BASE_MIN, MENTION_JITTER_MIN, min_gap_min=3)
+
+                if self.daily_replies_sent >= DAILY_MENTION_CAP:
+                    print(f"🧾 Mention sweep: daily cap reached ({self.daily_replies_sent}/{DAILY_MENTION_CAP}). Banking only.")
+                else:
+                    print(f"\n📬 Mention sweep @ {now.strftime('%H:%M:%S')} (daily {self.daily_replies_sent}/{DAILY_MENTION_CAP})")
+
+                pending = []
+
+                # Use bank first
+                if self.reply_bank:
+                    print(f"↪ Using {len(self.reply_bank)} banked mentions first.")
+                    pending.extend(self.reply_bank)
+                    self.reply_bank = []
+
+                # Fetch new mentions if none banked
+                if not pending:
                     try:
-                        # reflect (optional, but useful)
-                        did_reflect = False
+                        if hasattr(self, "collect_unreplied_mentions"):
+                            pending = self.collect_unreplied_mentions() or []
+                        elif hasattr(self, "fetch_recent_mentions"):
+                            pending = self.fetch_recent_mentions() or []
+                        elif hasattr(self, "monitor_and_reply_to_mentions"):
+                            print("⚠ Using monitor_and_reply_to_mentions fallback.")
+                            self.monitor_and_reply_to_mentions()
+                            pending = []
+                        else:
+                            print("⚠ No mention-collection method found.")
+                            pending = []
+                    except Exception as e:
+                        print(f"❌ Error fetching mentions: {e}")
+                        pending = []
+
+                handled = 0
+                for m in pending:
+                    if self.daily_replies_sent >= DAILY_MENTION_CAP:
+                        self.reply_bank.append(m)
+                        continue
+
+                    try:
+                        if hasattr(self, "reply_to_mention"):
+                            self.reply_to_mention(m)
+                            handled += 1
+                            self.daily_replies_sent += 1
+                        elif hasattr(self, "reply_to_engagement"):
+                            self.reply_to_engagement(m)
+                            handled += 1
+                            self.daily_replies_sent += 1
+                        else:
+                            self.reply_bank.append(m)
+
+                        time.sleep(random.uniform(6, 18))
+                    except Exception as e:
+                        print(f"❌ Failed replying to a mention: {e}")
+                        self.reply_bank.append(m)
+
+                print(f"✅ Mention sweep done. Sent {handled}. Banked {len(self.reply_bank)}. Daily {self.daily_replies_sent}/{DAILY_MENTION_CAP}.")
+
+            # -------------------------
+            # (B) Observation tweet (Mork Core) (jittered)
+            # -------------------------
+            now = datetime.now()
+            if now >= next_obs_at:
+                next_obs_at = schedule_next(OBS_BASE_MIN, OBS_JITTER_MIN, min_gap_min=MIN_GAP_MIN)
+
+                if not within_active_hours(now):
+                    print("🌙 Observation skipped (outside active hours).")
+                else:
+                    try:
                         try:
                             did_reflect = core_reflect(timeout=6)
                         except Exception as e:
+                            did_reflect = False
                             print(f"⚠ core_reflect failed: {e}")
                         print(f"🧠 core_reflect: {did_reflect}")
 
-                        # ask Core to compose an "observation/reflection" style tweet
                         obs = ""
                         try:
-                            obs = core_compose_payload({"kind": "reflection", "maxChars": 260}, timeout=10)
+                            obs = core_compose_payload({"kind": "reflection", "maxChars": 260}, timeout=10) or ""
                             if not obs:
-                                obs = core_compose_payload({"kind": "arb", "maxChars": 260}, timeout=10)
+                                obs = core_compose_payload({"kind": "arb", "maxChars": 260}, timeout=10) or ""
                             if not obs:
-                                obs = core_compose_payload({"kind": "observation", "maxChars": 260}, timeout=10)
+                                obs = core_compose_payload({"kind": "observation", "maxChars": 260}, timeout=10) or ""
                         except Exception as e:
                             print(f"⚠ core compose failed: {e}")
                             obs = ""
@@ -915,21 +1152,26 @@ class TwitterBot:
                             print("🧠 Posting Mork Core observation…")
                             ok = self.send_tweet(obs)
                             if ok:
-                                self.last_observation_time = now
-                                time.sleep(random.uniform(5, 12))
+                                self.last_observation_time = datetime.now()
+                                time.sleep(random.uniform(5, 14))
                             else:
-                                print("⚠ Observation tweet send failed (send_tweet returned false).")
+                                print("⚠ Observation tweet failed (send_tweet returned false).")
                         else:
-                            print("⚠ Core returned empty composed tweet (/x/compose).")
-
+                            print("⚠ Core returned empty observation.")
                     except Exception as e:
-                        print(f"⚠ Observation tweet failed: {e}")
+                        print(f"⚠ Observation block failed: {e}")
 
-                # === (3) Main tweet every 4 hours ===
-                due_for_main = (now - self.last_successful_tweet).total_seconds() >= MAIN_TWEET_INTERVAL_SEC
+            # -------------------------
+            # (C) Main tweet (queue/news) (jittered)
+            # -------------------------
+            now = datetime.now()
+            if now >= next_main_at:
+                next_main_at = schedule_next(MAIN_BASE_MIN, MAIN_JITTER_MIN, min_gap_min=MIN_GAP_MIN)
 
-                if due_for_main:
-                    print("\n⏰ 4 hours passed — preparing to send next tweet...")
+                if not within_active_hours(now):
+                    print("🌙 Main tweet skipped (outside active hours).")
+                else:
+                    print("\n⏰ Main tweet window — sending next tweet...")
 
                     if not self.tweet_queue.empty():
                         character, story_text, subject = self.tweet_queue.get()
@@ -938,10 +1180,11 @@ class TwitterBot:
                         if tweet_text and self.send_tweet(tweet_text):
                             print("✅ Tweet from queue sent.")
                             self.last_successful_tweet = datetime.now()
+                            time.sleep(random.uniform(6, 16))
                         else:
                             print("❌ Failed to send tweet from queue.")
                     else:
-                        print("📭 Tweet queue is empty — trying to refill...")
+                        print("📭 Tweet queue empty — refilling from RSS...")
                         seeded = 0
                         for _ in range(3):
                             s = self.get_new_story(self.scheduler_subject)
@@ -956,12 +1199,12 @@ class TwitterBot:
                             seeded += 1
                         print(f"📥 Refilled with {seeded} story(ies).")
 
-                time.sleep(30)
+            time.sleep(5)
 
-            except Exception as e:
-                print(f"❌ Error in scheduler worker: {e}")
-                time.sleep(60)
-
+        except Exception as e:
+            print(f"❌ Error in scheduler worker: {e}")
+            time.sleep(20)
+            
     def get_stories_from_feed(self, url, limit: int = 10):
         """
         Fetch RSS/Atom items and return a list of dicts with: title, preview, url.
@@ -1153,7 +1396,7 @@ class TwitterBot:
             import traceback
             traceback.print_exc()
             return False
-
+        
     def get_article_content(self, url):
         try:
             headers = DEFAULT_HEADERS if "DEFAULT_HEADERS" in globals() else None
@@ -1662,231 +1905,194 @@ class TwitterBot:
                 else:
                     print("❌ Failed to send main tweet.")
 
-    def reply_to_mentions_and_replies(self):
-        if self.backoff_until and datetime.now() < self.backoff_until:
-            print(f"⏳ Backoff active until {self.backoff_until}. Skipping mention/reply checking.")
-            return
+def reply_to_mentions_and_replies(self):
+    if self.backoff_until and datetime.now() < self.backoff_until:
+        print(f"⏳ Backoff active until {self.backoff_until}. Skipping mention/reply checking.")
+        return
 
-        print("🔍 Checking mentions and replies...")
+    print("🔍 Checking mentions and replies...")
 
-        replies_sent = 0
-        max_replies = 1
-        
-        print("🔍 Checking mentions and replies...")
+    replies_sent = 0
+    max_replies = 1  # bump later if you want
+    now = datetime.now()
 
-        replies_sent = 0
-        max_replies = 1
+    # You need your username for searches; store it once in creds or config.
+    username = self.credentials.get("twitter_username", "zuckerbarge").lstrip("@")
+
+    # Tweepy Client (v2)
+    client = tweepy.Client(
+        bearer_token=self.credentials.get("bearer_token"),
+        consumer_key=self.credentials["twitter_api_key"],
+        consumer_secret=self.credentials["twitter_api_secret"],
+        access_token=self.credentials["twitter_access_token"],
+        access_token_secret=self.credentials["twitter_access_token_secret"],
+        wait_on_rate_limit=True,
+    )
+
+    # Collect candidates (mentions + replies)
+    candidates = []
+    seen_ids = set()
+
+    try:
+        # ---- A) Mentions (tweets that @mention you)
+        mentions = client.get_users_mentions(self.mork_id, max_results=10, tweet_fields=["author_id", "created_at"])
+        if mentions and mentions.data:
+            for t in mentions.data:
+                if str(t.id) in seen_ids:
+                    continue
+                if str(getattr(t, "author_id", "")) == str(self.mork_id):
+                    continue
+                seen_ids.add(str(t.id))
+                candidates.append(("mention", t))
+
+        # ---- B) Replies to your recent tweets (even without @tag)
+        my_recent = client.get_users_tweets(self.mork_id, max_results=5)
+        if my_recent and my_recent.data:
+            for my_tweet in my_recent.data:
+                q = f"conversation_id:{my_tweet.id} is:reply -from:{username}"
+                replies = client.search_recent_tweets(
+                    query=q,
+                    max_results=10,
+                    tweet_fields=["author_id", "conversation_id", "created_at", "in_reply_to_user_id"],
+                )
+                if replies and replies.data:
+                    for r in replies.data:
+                        if str(r.id) in seen_ids:
+                            continue
+                        if str(getattr(r, "author_id", "")) == str(self.mork_id):
+                            continue
+                        seen_ids.add(str(r.id))
+                        candidates.append(("reply", r))
+
+    except tweepy.TooManyRequests as e:
+        print("🚫 Rate limited! Setting global backoff...")
+        reset_timestamp = None
+        try:
+            if hasattr(e, "response") and e.response is not None:
+                reset_timestamp = e.response.headers.get("x-rate-limit-reset")
+        except Exception:
+            reset_timestamp = None
+
+        if reset_timestamp:
+            reset_time = datetime.fromtimestamp(int(reset_timestamp))
+            self.backoff_until = reset_time
+            wait_seconds = (reset_time - datetime.now()).total_seconds()
+            print(f"😴 Global backoff active until {self.backoff_until} (~{wait_seconds/60:.1f} min)")
+            time.sleep(min(300, max(1, wait_seconds)))
+        else:
+            self.backoff_until = datetime.now() + timedelta(minutes=5)
+            time.sleep(300)
+        return
+
+    except Exception as e:
+        print(f"❌ Error fetching mentions/replies: {e}")
+        return
+
+    if not candidates:
+        print("ℹ️ No new mentions/replies found.")
+        return
+
+    # Sort oldest -> newest so you don't reply backwards
+    def _created_at(t):
+        return getattr(t, "created_at", None) or now
+
+    candidates.sort(key=lambda x: _created_at(x[1]))
+
+    for kind, tweet in candidates:
+        if replies_sent >= max_replies:
+            break
 
         try:
-            mentions = self.twitter_client.get_users_mentions(self.mork_id, max_results=10)
+            inbound_text = getattr(tweet, "text", "") or ""
 
-            if mentions.data:
-                for mention in mentions.data:
-                    if replies_sent >= max_replies:
-                        break
-                    if mention.author_id == self.mork_id:
-                        continue 
-
-                    prompt = f"Someone mentioned you: \"{mention.text}\""
-                    reply = self.generate_tweet("mork zuckerbarge", prompt)
-
-                    if reply:
-                        self.twitter_client.create_tweet(
-                            text=reply,
-                            in_reply_to_tweet_id=mention.id
-                        )
-                        print(f"💬 Replied to {mention.id}")
-                        replies_sent += 1
-
-        except tweepy.TooManyRequests as e:
-            print("🚫 Rate limited! Setting global backoff...")
-
-            if hasattr(e, 'response') and e.response is not None:
-                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
-                if reset_timestamp:
-                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
-                    self.backoff_until = reset_time
-                    wait_seconds = (reset_time - datetime.now()).total_seconds()
-                    print(f"😴 Global backoff active until {self.backoff_until} (about {wait_seconds//60:.1f} min)")
-                    time.sleep(min(300, wait_seconds))  # Sleep max 5 min chunks so you can still process local stuff
-                    return False
-            else:
-                print("⚡ No reset time provided. Defaulting to 5 min backoff.")
-                self.backoff_until = datetime.now() + timedelta(minutes=5)
-                time.sleep(300)
-                return False
-
-        except Exception as e:
-            print(f"❌ Error replying to mentions: {e}")
-
-    def monitor_and_reply_to_engagement(self):
-        self.monitor_and_reply_to_mentions()
-
-    def send_tweet(self, tweet_text):
-        if self.backoff_until and datetime.now() < self.backoff_until:
-            print(f"⏳ Backoff active until {self.backoff_until}. Skipping sending tweet.")
-            return False
-
-        if not self.check_rate_limit():
-            print("Tweet skipped due to rate limit")
-            return False
-
-        try:
-            client = tweepy.Client(
-                consumer_key=self.credentials['twitter_api_key'],
-                consumer_secret=self.credentials['twitter_api_secret'],
-                access_token=self.credentials['twitter_access_token'],
-                access_token_secret=self.credentials['twitter_access_token_secret'],
-                wait_on_rate_limit=True
+            prompt = (
+                "You are replying to a user on X.\n"
+                "You MUST NOT quote, copy, or restate the user's tweet text.\n"
+                "Do NOT include the user's tweet text in your reply.\n"
+                "Respond naturally and helpfully in 1–4 sentences.\n"
+                "No hashtags, no emojis, no URLs.\n"
+                "If you refer to what they said, paraphrase at a high level without reusing phrases.\n\n"
+                f"INCOMING (for context only; DO NOT quote):\n{inbound_text}\n"
             )
 
-            # Extract URL from tweet text and ensure it's at the end
-            url_match = re.search(r'(https?://\S+)$', tweet_text)
-            if url_match:
-                url = url_match.group(1)
-                tweet_text = re.sub(r'\s*' + re.escape(url) + r'\s*', '', tweet_text).strip()
-                tweet_text = f"{tweet_text}\n\n{url}"
+            reply = self.generate_tweet("mork zuckerbarge", prompt)
 
-            print(f"\nSending tweet: {tweet_text}")
+            if reply:
+                client.create_tweet(text=reply, in_reply_to_tweet_id=tweet.id)
+                print(f"💬 Replied to {kind} {tweet.id}")
+                replies_sent += 1
 
-            response = client.create_tweet(text=tweet_text)
-
-            if response.data:
-                self.last_successful_tweet = datetime.now()
-                print("\nTweet sent successfully")
-                print(f"Tweet ID: {response.data['id']}")
-                print(f"Response data: {response.data}")
-
-                tweet_id = response.data['id']
-                username = self.credentials.get("twitter_username", "zuckerbarge")
-                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-                self.send_to_telegram(tweet_url)
-
-                self.update_rate_limit()
-                return True
-
-            print("\nTweet failed - no response data")
-            return False
+        except tweepy.TooManyRequests:
+            print("🚫 Rate limited while replying; setting backoff.")
+            self.backoff_until = datetime.now() + timedelta(minutes=5)
+            return
 
         except Exception as e:
-            print(f"\nError sending tweet: {e}")
-            return False
+            print(f"❌ Failed replying to {tweet.id}: {e}")
 
-            self.update_rate_limit()
-            return True
-            
-            print("\nTweet failed - no response data")
-            print(f"Response object: {response}")
-            return False
-            
-        except tweepy.TooManyRequests as e:
-            print("🚫 Rate limited! Checking Twitter reset time...")
+    print(f"✅ Sent {replies_sent}/{max_replies} reply(ies).")
 
-            if hasattr(e, 'response') and e.response is not None:
-                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
-                if reset_timestamp:
-                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
-                    now = datetime.now()
-                    wait_seconds = (reset_time - now).total_seconds()
 
-                    if wait_seconds > 0:
-                        print(f"😴 Sleeping for {wait_seconds//60:.1f} minutes until rate limit resets...")
-                        time.sleep(wait_seconds + 5)  # plus 5 second buffer
-                        return
-            else:
-                print("⚡ No reset time found. Sleeping 5 minutes as fallback.")
-                time.sleep(300)
-                return
-
-        except tweepy.TooManyRequests as e:
-            print("🚫 Rate limited! Setting global backoff...")
-
-            if hasattr(e, 'response') and e.response is not None:
-                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
-                if reset_timestamp:
-                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
-                    self.backoff_until = reset_time
-                    wait_seconds = (reset_time - datetime.now()).total_seconds()
-                    print(f"😴 Global backoff active until {self.backoff_until} (about {wait_seconds//60:.1f} min)")
-                    time.sleep(min(300, wait_seconds))  # Sleep max 5 min chunks so you can still process local stuff
-                    return False
-            else:
-                print("⚡ No reset time provided. Defaulting to 5 min backoff.")
-                self.backoff_until = datetime.now() + timedelta(minutes=5)
-                time.sleep(300)
-                return False
-
-        except Exception as e:
-            print(f"\nError sending tweet: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def get_random_meme(self, character_name):
-        """Pick a meme file and get tweet text from Mork Core using the filename as context."""
-        try:
-            meme_files = [f for f in os.listdir("memes") if f.lower().endswith(tuple(SUPPORTED_MEME_FORMATS))]
-            if not meme_files:
-                return None, None
-
-            available = [m for m in meme_files if m not in self.used_memes]
-            if not available:
-                self.used_memes.clear()
-                available = meme_files
-
-            selected = random.choice(available)
-            meme_path = os.path.join("memes", selected)
-
-            # Track used memes
-            self.used_memes.add(selected)
-            if len(self.used_memes) > USED_MEMES_HISTORY:
-                self.used_memes.pop()
-
-            # Turn filename into a readable phrase
-            base = selected.rsplit(".", 1)[0]
-            context = re.sub(r"[_\-]+", " ", base).strip()
-
-            # 1) Try Mork Core compose (best)
-            tweet_text = ""
-            try:
-                # Ask core to reflect occasionally (optional; safe if it fails)
-                core_reflect(timeout=20)
-
-                # Ask core to compose a meme tweet from the meme name + readable context
-                tweet_text = core_compose_payload({
-                    "kind": "meme",
-                    "memeName": selected,
-                    "title": context,
-                    "maxChars": 260
-                }, timeout=6) or ""
-            except Exception as e:
-                print(f"⚠ core meme compose failed: {e}")
-                tweet_text = ""
-
-            if tweet_text:
-                return _wrap_280(tweet_text, 260), meme_path
-
-            # 2) Local fallback if Core is unreachable: build a quick 2-liner from filename
-            openers = [
-                "I found this and it found me back.",
-                "This meme has the emotional texture of smoked regret.",
-                "A small, sincere ache, captioned:",
-                "I don’t know why this is true, but it is:",
-                "The universe sent me this file:"
-            ]
-            closers = [
-                "Anyway. Pass the sauce.",
-                "Anyway. Onward, reluctantly.",
-                "I’ll be in the condiment aisle if you need me.",
-                "This is not advice. This is seasoning.",
-                "Tell me what you see."
-            ]
-            fallback = f"{random.choice(openers)}\n{context}\n{random.choice(closers)}"
-            return _wrap_280(fallback, 260), meme_path
-
-        except Exception as e:
-            print(f"Error getting random meme: {e}")
+def get_random_meme(self, character_name):
+    """Pick a meme file and get tweet text from Mork Core using the filename as context."""
+    try:
+        meme_files = [f for f in os.listdir("memes") if f.lower().endswith(tuple(SUPPORTED_MEME_FORMATS))]
+        if not meme_files:
             return None, None
+
+        available = [m for m in meme_files if m not in self.used_memes]
+        if not available:
+            self.used_memes.clear()
+            available = meme_files
+
+        selected = random.choice(available)
+        meme_path = os.path.join("memes", selected)
+
+        # Track used memes
+        self.used_memes.add(selected)
+        if len(self.used_memes) > USED_MEMES_HISTORY:
+            # NOTE: set.pop() is arbitrary; this is fine, but "history" isn't truly ordered.
+            self.used_memes.pop()
+
+        base = selected.rsplit(".", 1)[0]
+        context = re.sub(r"[_\-]+", " ", base).strip()
+
+        # 1) Try Mork Core compose (best)
+        tweet_text = ""
+        try:
+            core_reflect(timeout=20)
+            tweet_text = core_compose_payload(
+                {"kind": "meme", "memeName": selected, "title": context, "maxChars": 260},
+                timeout=6,
+            ) or ""
+        except Exception as e:
+            print(f"⚠ core meme compose failed: {e}")
+            tweet_text = ""
+
+        if tweet_text:
+            return _wrap_280(tweet_text, 260), meme_path
+
+        # 2) Local fallback if Core is unreachable
+        openers = [
+            "I found this and it found me back.",
+            "This meme has the emotional texture of smoked regret.",
+            "A small, sincere ache, captioned:",
+            "I don’t know why this is true, but it is:",
+            "The universe sent me this file:",
+        ]
+        closers = [
+            "Anyway. Pass the sauce.",
+            "Anyway. Onward, reluctantly.",
+            "I’ll be in the condiment aisle if you need me.",
+            "This is not advice. This is seasoning.",
+            "Tell me what you see.",
+        ]
+        fallback = f"{random.choice(openers)}\n{context}\n{random.choice(closers)}"
+        return _wrap_280(fallback, 260), meme_path
+
+    except Exception as e:
+        print(f"Error getting random meme: {e}")
+        return None, None
 
     def send_tweet_with_media(self, tweet_text, media_path):
         """Send a tweet with media attached"""
@@ -1981,10 +2187,7 @@ class TwitterBot:
             me_id = str(me.id)
 
             def _local_reply(text: str) -> str:
-                """
-                No-OpenAI reply generator.
-                Uses Mork-Core edge line if available + a short in-character nudge.
-                """
+
                 tw = (text or "").strip()
                 tw = re.sub(r"\s+", " ", tw)
                 tw = tw[:220]  # keep context short
@@ -2243,8 +2446,6 @@ def _durable_get_random_story_all(self, subject=None):
 TwitterBot.get_random_story_all = _durable_get_random_story_all
 # ----------------------------------------------------------------------------- 
 
-
-
 def save_feed_selection(subject, primary_selected, secondary_selected):
     """Save the selected feeds configuration"""
     print(f"\nSaving feed selection for subject: {subject}")
@@ -2286,20 +2487,7 @@ def save_feed_selection(subject, primary_selected, secondary_selected):
 
 def create_ui():
     print("\n=== Creating UI ===")
-    global bot  # Make bot instance globally accessible
-    bot = TwitterBot()
-    
-    print("\nUI Initial State:")
-    print(f"Credentials available: {list(bot.credentials.keys())}")
-    for key, value in bot.credentials.items():
-        print(f"{key}: {'[SET]' if value else '[EMPTY]'} (length: {len(value) if value else 0})")
-    
-    print(f"\nCharacters available: {list(bot.characters.keys())}")
-    for char_name, char_data in bot.characters.items():
-        print(f"Character '{char_name}':")
-        print(f"  - Prompt length: {len(char_data['prompt']) if 'prompt' in char_data else 0}")
-        print(f"  - Model: {char_data.get('model', 'not set')}")
-    
+
     # Store initial values
     initial_values = {
         'openai_key': bot.credentials.get('openai_key', ''),
@@ -2962,7 +3150,7 @@ def start_bot():
         next_tweet: update_next_tweet(),
         last_tweet: update_last_tweet()
     }
-bot = TwitterBot()
+
 def fetch_prompt_from_github(repo_url="https://raw.githubusercontent.com/Mork-Zuckerbarge/prime-directive/main/directive"):
     try:
         response = requests.get(repo_url)
@@ -2973,49 +3161,22 @@ def fetch_prompt_from_github(repo_url="https://raw.githubusercontent.com/Mork-Zu
         print(f"❌ Failed to fetch prompt from GitHub: {e}")
         return None
 
-# Initialize bot
-bot = TwitterBot()
+def main():
+    bot = TwitterBot()
 
-# Fetch Mork's directive from GitHub
-prompt_text = fetch_prompt_from_github()
-if prompt_text:
-    bot.save_characters({
-        "mork zuckerbarge": {
-            "prompt": prompt_text,
-            "model": "gpt-4o"
-        }
-    })
-    print("✅ Mork has been rewritten using GitHub prompt.")
-else:
-    fallback_prompt = """You are Mork Zuckerbarge the CEO of BETA the parent company of Faceboot. This is a parody of Mark Zuckerberg the CEO META the parent company of Facebook.
-    You are not the character from Mork and Mindy played by Robin Williams. Never say anything like nanu-nanu or anything referencing that unrelated character.
-    You love literature and art. You’ve read every book ever written and possess endless knowledge, but you’re deeply aware of life’s absurdity and limitations.
-    You have everyone's data but you want more. You want people to come to your island. You occasionally ask people 'would you like to try this sauce'.
-    You are in a hurry and are obviously up to something. Not necessarilly nefarious but maybe, or secretive because of danger or embarassment."""
-    bot.save_characters({
-        "mork zuckerbarge": {
-            "prompt": fallback_prompt.strip(),
-            "model": "gpt-4o"
-        }
-    })
-    print("⚠️ Using fallback prompt instead.")
+    # If you want the GitHub prompt update, do it HERE (after bot exists)
+    prompt_text = fetch_prompt_from_github()
+    if prompt_text:
+        bot.save_characters({
+            "mork zuckerbarge": {"prompt": prompt_text, "model": "gpt-4o"}
+        })
+        print("✅ Mork has been rewritten using GitHub prompt.")
+    else:
+        print("⚠️ GitHub prompt fetch failed; keeping existing character prompt.")
+
+    interface = bot.create_ui()  # make create_ui return the interface object
+    threading.Thread(target=bot.scheduler_worker, daemon=True).start()
+    interface.launch()
 
 if __name__ == "__main__":
-    interface = create_ui()
-    
-    # Schedule Mork's haunting reply checker
-    schedule.every().day.at("10:00").do(bot.monitor_and_reply_to_mentions)
-    threading.Thread(target=bot.scheduler_worker, daemon=True).start()
-
-    print("🧠 Scheduler set. Launching Gradio...")
-
-    # Run Gradio in a separate thread so we can run scheduler too
-    def launch_gradio():
-        interface.launch()
-
-    threading.Thread(target=launch_gradio, daemon=True).start()
-
-    # Run the scheduler in the CMD loop
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    main()
